@@ -51,7 +51,57 @@ static inline T Read(uintptr_t a) {
     if (a < 0x10000 || a > 0x7FFFFFFFFFFFull) return T{};
     return *reinterpret_cast<T*>(a);
 }
+// ---------------- offset hunter ----------------
+static std::vector<uintptr_t> g_gameHits;
 
+static bool Readable(uintptr_t p) {
+    if (p < 0x10000 || p > 0x7FFFFFFFFFFFull) return false;
+    if (p & 0x7) return false;
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (!VirtualQuery(reinterpret_cast<LPCVOID>(p), &mbi, sizeof(mbi))) return false;
+    if (mbi.State != MEM_COMMIT) return false;
+    if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) return false;
+    return true;
+}
+
+// Walk the known member chain from every 8-byte-aligned value in the module.
+// A hit means the camera landed on sane floats -> that value is the Game ptr.
+static void HuntGame() {
+    g_gameHits.clear();
+    if (!g_base) return;
+
+    auto dos = reinterpret_cast<PIMAGE_DOS_HEADER>(g_base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return;
+    auto nt = reinterpret_cast<PIMAGE_NT_HEADERS>(g_base + dos->e_lfanew);
+    size_t imgSize = nt->OptionalHeader.SizeOfImage;
+
+    for (size_t off = 0; off + sizeof(uintptr_t) <= imgSize; off += sizeof(uintptr_t)) {
+        uintptr_t v = Read<uintptr_t>(g_base + off);
+        if (!Readable(v)) continue;
+
+        uintptr_t w = Read<uintptr_t>(v + g_off.GameWorld);
+        if (!Readable(w)) continue;
+
+        uintptr_t cw = Read<uintptr_t>(w + g_off.LocalPlayerController);
+        if (!Readable(cw)) continue;
+
+        uintptr_t c = Read<uintptr_t>(cw + g_off.WeakPtr);
+        if (!Readable(c)) continue;
+
+        uintptr_t pc = Read<uintptr_t>((c - g_off.LocalPlayerDelta) + g_off.LocalPlayerCamera);
+        if (!Readable(pc)) continue;
+
+        Vec3 pos = Read<Vec3>(pc + g_off.CameraPosition);
+        Vec3 fwd = Read<Vec3>(pc + g_off.VectorViewForward);
+        if (!std::isfinite(pos.x) || !std::isfinite(pos.y) || !std::isfinite(pos.z)) continue;
+        if (!std::isfinite(fwd.x) || !std::isfinite(fwd.y) || !std::isfinite(fwd.z)) continue;
+        float mag = sqrtf(pos.x * pos.x + pos.y * pos.y + pos.z * pos.z);
+        if (mag < 1.f || mag > 200000.f) continue;
+
+        g_gameHits.push_back(off);
+        if (g_gameHits.size() >= 24) break;
+    }
+}
 // ---------------- state ----------------
 struct Player {
     float dist = 0.f, hp = 0.f, hpMax = 0.f;
@@ -244,7 +294,16 @@ static void Draw(HDC dc, int w, int h) {
         swprintf_s(buf, L"cam %.1f %.1f %.1f", g_cam.pos.x, g_cam.pos.y, g_cam.pos.z);
         lines.push_back(buf);
         lines.push_back(g_status.empty() ? L"status OK" : g_status);
-        lines.push_back(L"F1 esp  F2 debug");
+
+        swprintf_s(buf, L"Game off = 0x%llX", (unsigned long long)g_off.Game);
+        lines.push_back(buf);
+        if (!g_gameHits.empty()) {
+            swprintf_s(buf, L"HITS %d  first 0x%llX  (F4 = try next)",
+                       (int)g_gameHits.size(), (unsigned long long)g_gameHits[0]);
+            lines.push_back(buf);
+        }
+        lines.push_back(L"F1 esp  F2 debug  F3 hunt  F4 apply");
+        
 
         int y = 8;
         for (auto& l : lines) { Text(dc, 10, y, l, RGB(0, 220, 255)); y += 17; }
@@ -322,6 +381,13 @@ static DWORD WINAPI MainThread(LPVOID) {
 
         if (KeyPressed(VK_F1)) g_espOn     = !g_espOn;
         if (KeyPressed(VK_F2)) g_showDebug = !g_showDebug;
+        if (KeyPressed(VK_F3)) HuntGame();
+        if (KeyPressed(VK_F4) && !g_gameHits.empty()) {
+            static size_t idx = 0;
+            g_off.Game = g_gameHits[idx % g_gameHits.size()];
+            idx++;
+        }
+        
 
         Update();
         InvalidateRect(g_hwnd, nullptr, FALSE);
