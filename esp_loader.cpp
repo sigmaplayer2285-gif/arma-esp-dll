@@ -1,47 +1,258 @@
-// esp_loader.cpp - injected ESP skeleton
+// esp_loader.cpp - stage 2: chain + ESP + debug readout
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
 #include <cstdint>
+#include <cstdio>
+#include <cmath>
 #include <atomic>
+#include <string>
+#include <vector>
 
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "user32.lib")
 
-static HMODULE           g_hSelf   = nullptr;
-static HWND              g_hwnd    = nullptr;
-static std::atomic<bool> g_running{ false };
-static uintptr_t         g_base    = 0;
+// ---------------- config ----------------
+static bool  g_espOn     = true;
+static bool  g_showDebug = true;
+static float g_maxDist   = 800.f;
+static float g_aimHeight = 1.72f;
 
-// ---------- in-process read: no handle, so BattlEye can't block it ----------
+// ---------------- offsets (same keys as your offsets.ini) ----------------
+struct Offsets {
+    uintptr_t Game                  = 0x1D4FCE8;
+    uintptr_t GameWorld             = 0x130;
+    uintptr_t LocalPlayerController = 0x378;
+    uintptr_t WeakPtr               = 0x8;
+    uintptr_t LocalPlayerDelta      = 0x10;
+    uintptr_t LocalPlayerCamera     = 0xD0;
+    uintptr_t CameraPosition        = 0x68;
+    uintptr_t InvertedViewRight     = 0x80;
+    uintptr_t InvertedViewUp        = 0x8C;
+    uintptr_t VectorViewForward     = 0x98;
+    uintptr_t EntityList            = 0xF8;
+    uintptr_t EntityCount           = 0x104;
+    uintptr_t EntityPosition        = 0x8C;
+    uintptr_t HealthChain1          = 0x158;
+    uintptr_t HealthChain2          = 0xD8;
+    uintptr_t Health                = 0x44;
+    uintptr_t MaxHealth             = 0x40;
+} g_off;
+
+// ---------------- math ----------------
+struct Vec2 { float x = 0, y = 0; };
+struct Vec3 { float x = 0, y = 0, z = 0; };
+
+// ---------------- memory: in-process, plain dereference ----------------
+static uintptr_t g_base = 0;
+
 template <typename T>
 static inline T Read(uintptr_t a) {
     if (a < 0x10000 || a > 0x7FFFFFFFFFFFull) return T{};
     return *reinterpret_cast<T*>(a);
 }
 
-// ---------- same offsets as your external tool ----------
-static uintptr_t OFF_Game      = 0x1D4FCE8;
-static uintptr_t OFF_GameWorld = 0x130;
+// ---------------- state ----------------
+struct Player {
+    float dist = 0.f, hp = 0.f, hpMax = 0.f;
+    bool  onScreen = false;
+    Vec2  head, foot;
+};
 
-// ---------- overlay ----------
+struct Camera {
+    Vec3 pos, right, up, fwd;
+    float fov = 1.15f;
+    bool  valid = false;
+};
+
+static HMODULE             g_hSelf    = nullptr;
+static HWND                g_hwnd     = nullptr;
+static std::atomic<bool>   g_running{ false };
+static HFONT               g_font     = nullptr;
+
+static Camera              g_cam;
+static std::vector<Player> g_players;
+static std::wstring        g_status;
+static uintptr_t           g_game = 0, g_world = 0, g_local = 0;
+static int                 g_entCount = 0, g_candidates = 0;
+static int                 g_scrW = 0, g_scrH = 0;
+
+static bool WorldToScreen(const Vec3& w, Vec2& out) {
+    if (!g_cam.valid || g_scrW < 1 || g_scrH < 1) return false;
+    Vec3 d{ w.x - g_cam.pos.x, w.y - g_cam.pos.y, w.z - g_cam.pos.z };
+    float x = d.x * g_cam.right.x + d.y * g_cam.right.y + d.z * g_cam.right.z;
+    float y = d.x * g_cam.up.x    + d.y * g_cam.up.y    + d.z * g_cam.up.z;
+    float z = d.x * g_cam.fwd.x   + d.y * g_cam.fwd.y   + d.z * g_cam.fwd.z;
+    if (z <= 0.05f) return false;
+    float tanY = tanf(g_cam.fov * 0.5f);
+    if (tanY < 1e-6f) return false;
+    float tanX = tanY * ((float)g_scrW / (float)g_scrH);
+    out.x = (g_scrW * 0.5f) * (1.f + (x / z) / tanX);
+    out.y = (g_scrH * 0.5f) * (1.f - (y / z) / tanY);
+    return true;
+}
+
+static bool Finite(const Vec3& v) {
+    return std::isfinite(v.x) && std::isfinite(v.y) && std::isfinite(v.z);
+}
+
+// ---------------- chain ----------------
+static void Update() {
+    g_players.clear();
+    g_status.clear();
+    g_candidates = 0;
+    g_cam.valid  = false;
+
+    g_game = Read<uintptr_t>(g_base + g_off.Game);
+    if (!g_game) { g_status = L"game null"; return; }
+
+    g_world = Read<uintptr_t>(g_game + g_off.GameWorld);
+    if (!g_world) { g_status = L"world null"; return; }
+
+    uintptr_t ctrlWeak = Read<uintptr_t>(g_world + g_off.LocalPlayerController);
+    if (!ctrlWeak) { g_status = L"ctrl weak null"; return; }
+    uintptr_t ctrl = Read<uintptr_t>(ctrlWeak + g_off.WeakPtr);
+    if (!ctrl) { g_status = L"ctrl null"; return; }
+    g_local = ctrl - g_off.LocalPlayerDelta;
+
+    uintptr_t pc = Read<uintptr_t>(g_local + g_off.LocalPlayerCamera);
+    if (!pc) { g_status = L"camera null"; return; }
+
+    g_cam.pos   = Read<Vec3>(pc + g_off.CameraPosition);
+    g_cam.right = Read<Vec3>(pc + g_off.InvertedViewRight);
+    g_cam.up    = Read<Vec3>(pc + g_off.InvertedViewUp);
+    g_cam.fwd   = Read<Vec3>(pc + g_off.VectorViewForward);
+    if (!Finite(g_cam.pos) || !Finite(g_cam.fwd)) { g_status = L"camera garbage"; return; }
+    g_cam.valid = true;
+
+    uintptr_t list = Read<uintptr_t>(g_world + g_off.EntityList);
+    int count = Read<int>(g_world + g_off.EntityCount);
+    g_entCount = count;
+    if (!list || count <= 0) { g_status = L"entity list empty"; return; }
+    if (count > 8192) count = 8192;
+
+    for (int i = 0; i < count; ++i) {
+        uintptr_t ent = Read<uintptr_t>(list + (uintptr_t)i * sizeof(uintptr_t));
+        if (!ent || ent < 0x10000 || ent == g_local) continue;
+
+        Vec3 pos = Read<Vec3>(ent + g_off.EntityPosition);
+        if (!Finite(pos) || (pos.x == 0.f && pos.y == 0.f && pos.z == 0.f)) continue;
+
+        Vec3 d{ pos.x - g_cam.pos.x, pos.y - g_cam.pos.y, pos.z - g_cam.pos.z };
+        float dist = sqrtf(d.x * d.x + d.y * d.y + d.z * d.z);
+        if (dist > g_maxDist || dist < 0.05f) continue;
+
+        uintptr_t h1 = Read<uintptr_t>(ent + g_off.HealthChain1);
+        if (!h1) continue;
+        uintptr_t h2 = Read<uintptr_t>(h1 + g_off.HealthChain2);
+        if (!h2) continue;
+        float hp    = Read<float>(h2 + g_off.Health);
+        float hpMax = Read<float>(h2 + g_off.MaxHealth);
+        if (!(hpMax > 1.f && hpMax < 10000.f)) continue;
+        if (!(hp > 0.f && hp <= hpMax)) continue;
+        g_candidates++;
+
+        Player p;
+        p.dist = dist; p.hp = hp; p.hpMax = hpMax;
+        Vec3 head{ pos.x, pos.y, pos.z + g_aimHeight };
+        p.onScreen = WorldToScreen(head, p.head);
+        if (p.onScreen) WorldToScreen(pos, p.foot);
+        g_players.push_back(p);
+    }
+}
+
+// ---------------- drawing ----------------
+static HFONT Font() {
+    if (!g_font)
+        g_font = CreateFontW(-14, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+                             DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
+                             ANTIALIASED_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Consolas");
+    return g_font;
+}
+
+static void Text(HDC dc, int x, int y, const std::wstring& s, COLORREF col) {
+    if (s.empty()) return;
+    HFONT old = (HFONT)SelectObject(dc, Font());
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, RGB(1, 1, 1));                 // shadow - never pure black
+    TextOutW(dc, x + 1, y, s.c_str(), (int)s.size());
+    TextOutW(dc, x, y + 1, s.c_str(), (int)s.size());
+    SetTextColor(dc, col);
+    TextOutW(dc, x, y, s.c_str(), (int)s.size());
+    SelectObject(dc, old);
+}
+
+static void Box(HDC dc, float x, float y, float w, float h, COLORREF col) {
+    HPEN pen = CreatePen(PS_SOLID, 1, col);
+    HPEN op  = (HPEN)SelectObject(dc, pen);
+    HBRUSH ob = (HBRUSH)SelectObject(dc, GetStockObject(NULL_BRUSH));
+    Rectangle(dc, (int)x, (int)y, (int)(x + w), (int)(y + h));
+    SelectObject(dc, ob);
+    SelectObject(dc, op);
+    DeleteObject(pen);
+}
+
+static void Fill(HDC dc, float x, float y, float w, float h, COLORREF col) {
+    RECT r{ (LONG)x, (LONG)y, (LONG)(x + w), (LONG)(y + h) };
+    HBRUSH b = CreateSolidBrush(col);
+    ::FillRect(dc, &r, b);
+    DeleteObject(b);
+}
+
 static void Draw(HDC dc, int w, int h) {
-    HBRUSH bg = CreateSolidBrush(RGB(0, 0, 0));   // pure black is the key colour
+    HBRUSH bg = CreateSolidBrush(RGB(0, 0, 0));      // pure black = transparent
     RECT rc{ 0, 0, w, h };
     FillRect(dc, &rc, bg);
     DeleteObject(bg);
 
-    HPEN pen = CreatePen(PS_SOLID, 1, RGB(0, 255, 130));
-    HPEN old = (HPEN)SelectObject(dc, pen);
-    SelectObject(dc, GetStockObject(NULL_BRUSH));
-    Ellipse(dc, w / 2 - 120, h / 2 - 120, w / 2 + 120, h / 2 + 120);
-    MoveToEx(dc, w / 2 - 12, h / 2, nullptr); LineTo(dc, w / 2 + 12, h / 2);
-    MoveToEx(dc, w / 2, h / 2 - 12, nullptr); LineTo(dc, w / 2, h / 2 + 12);
-    SelectObject(dc, old);
-    DeleteObject(pen);
+    if (g_espOn && g_cam.valid) {
+        for (const auto& p : g_players) {
+            if (!p.onScreen) continue;
+            float bh = fabsf(p.foot.y - p.head.y);
+            if (bh < 3.f) bh = 3.f;
+            float bw = bh * 0.55f;
+            float bx = (p.head.x + p.foot.x) * 0.5f - bw * 0.5f;
+            float by = p.head.y;
+
+            Box(dc, bx, by, bw, bh, RGB(0, 255, 130));
+
+            if (p.hpMax > 0.f) {
+                float frac = p.hp / p.hpMax;
+                if (frac < 0.f) frac = 0.f;
+                if (frac > 1.f) frac = 1.f;
+                Fill(dc, bx - 6.f, by, 3.f, bh, RGB(45, 45, 45));
+                Fill(dc, bx - 6.f, by + bh * (1.f - frac), 3.f, bh * frac, RGB(0, 255, 130));
+            }
+
+            wchar_t buf[32];
+            swprintf_s(buf, L"%dm", (int)p.dist);
+            Text(dc, (int)(bx + bw * 0.5f) - 14, (int)(by + bh + 2), buf, RGB(205, 205, 205));
+        }
+    }
+
+    if (g_showDebug) {
+        std::vector<std::wstring> lines;
+        wchar_t buf[256];
+
+        lines.push_back(L"ESP LOADED");
+        swprintf_s(buf, L"base  %llX", (unsigned long long)g_base);          lines.push_back(buf);
+        swprintf_s(buf, L"game  %llX", (unsigned long long)g_game);          lines.push_back(buf);
+        swprintf_s(buf, L"world %llX", (unsigned long long)g_world);         lines.push_back(buf);
+        swprintf_s(buf, L"local %llX", (unsigned long long)g_local);         lines.push_back(buf);
+        swprintf_s(buf, L"ents %d | cand %d | players %d",
+                   g_entCount, g_candidates, (int)g_players.size());         lines.push_back(buf);
+        swprintf_s(buf, L"cam %.1f %.1f %.1f", g_cam.pos.x, g_cam.pos.y, g_cam.pos.z);
+        lines.push_back(buf);
+        lines.push_back(g_status.empty() ? L"status OK" : g_status);
+        lines.push_back(L"F1 esp  F2 debug");
+
+        int y = 8;
+        for (auto& l : lines) { Text(dc, 10, y, l, RGB(0, 220, 255)); y += 17; }
+    }
 }
 
-static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+// ---------------- window ----------------
+static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
     switch (m) {
         case WM_ERASEBKGND: return 1;
         case WM_PAINT: {
@@ -54,7 +265,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         }
         case WM_DESTROY: PostQuitMessage(0); return 0;
     }
-    return DefWindowProcW(h, m, w, l);
+    return DefWindowProcW(h, m, wp, lp);
 }
 
 static bool CreateOverlay() {
@@ -78,7 +289,14 @@ static bool CreateOverlay() {
     return true;
 }
 
-// ---------- injected thread ----------
+static bool KeyPressed(int vk) {
+    static bool state[256] = {};
+    bool down = (GetAsyncKeyState(vk) & 0x8000) != 0;
+    bool fired = down && !state[vk];
+    state[vk] = down;
+    return fired;
+}
+
 static DWORD WINAPI MainThread(LPVOID) {
     g_base = (uintptr_t)GetModuleHandleW(nullptr);
     if (!CreateOverlay()) return 0;
@@ -98,12 +316,19 @@ static DWORD WINAPI MainThread(LPVOID) {
             ClientToScreen(game, &tl);
             SetWindowPos(g_hwnd, HWND_TOPMOST, tl.x, tl.y, cr.right, cr.bottom,
                          SWP_NOACTIVATE);
+            g_scrW = cr.right;
+            g_scrH = cr.bottom;
         }
 
+        if (KeyPressed(VK_F1)) g_espOn     = !g_espOn;
+        if (KeyPressed(VK_F2)) g_showDebug = !g_showDebug;
+
+        Update();
         InvalidateRect(g_hwnd, nullptr, FALSE);
         Sleep(1);
     }
 
+    if (g_font) DeleteObject(g_font);
     if (g_hwnd) DestroyWindow(g_hwnd);
     return 0;
 }
