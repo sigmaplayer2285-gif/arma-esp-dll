@@ -55,6 +55,7 @@ static inline T Read(uintptr_t a) {
         return T{};
     }
 }
+
 // ---------------- offset hunter ----------------
 static std::vector<uintptr_t> g_gameHits;
 
@@ -84,7 +85,6 @@ static void HuntGame() {
         if (!(sec[s].Characteristics & IMAGE_SCN_MEM_WRITE)) continue;
         size_t vsec = sec[s].Misc.VirtualSize;
         if (vsec < 8) continue;
-
         uintptr_t start = g_base + sec[s].VirtualAddress;
 
         for (size_t off = 0; off + sizeof(uintptr_t) <= vsec; off += sizeof(uintptr_t)) {
@@ -107,9 +107,26 @@ static void HuntGame() {
             Vec3 fwd = Read<Vec3>(pc + g_off.VectorViewForward);
             if (!std::isfinite(pos.x) || !std::isfinite(pos.y) || !std::isfinite(pos.z)) continue;
             if (!std::isfinite(fwd.x) || !std::isfinite(fwd.y) || !std::isfinite(fwd.z)) continue;
-
             float mag = sqrtf(pos.x * pos.x + pos.y * pos.y + pos.z * pos.z);
             if (mag < 1.f || mag > 200000.f) continue;
+
+            // strong test: your own player is in this list, so an entity must
+            // sit within 50 units of the camera
+            uintptr_t list = Read<uintptr_t>(v + g_off.EntityList);
+            int cnt = Read<int>(v + g_off.EntityCount);
+            if (!Readable(list, 8) || cnt < 1 || cnt > 20000) continue;
+
+            int lim = cnt < 256 ? cnt : 256;
+            bool near = false;
+            for (int i = 0; i < lim && !near; ++i) {
+                uintptr_t e = Read<uintptr_t>(list + (uintptr_t)i * sizeof(uintptr_t));
+                if (!Readable(e, 12)) continue;
+                Vec3 ep = Read<Vec3>(e + g_off.EntityPosition);
+                if (!std::isfinite(ep.x) || !std::isfinite(ep.y) || !std::isfinite(ep.z)) continue;
+                float dx = ep.x - pos.x, dy = ep.y - pos.y, dz = ep.z - pos.z;
+                if (dx * dx + dy * dy + dz * dz < 2500.f) near = true;
+            }
+            if (!near) continue;
 
             g_gameHits.push_back(sec[s].VirtualAddress + off);
             if (g_gameHits.size() >= 24) break;
@@ -117,6 +134,7 @@ static void HuntGame() {
         if (g_gameHits.size() >= 24) break;
     }
 }
+
 // ---------------- state ----------------
 struct Player {
     float dist = 0.f, hp = 0.f, hpMax = 0.f;
@@ -139,7 +157,7 @@ static Camera              g_cam;
 static std::vector<Player> g_players;
 static std::wstring        g_status;
 static uintptr_t           g_game = 0, g_world = 0, g_local = 0;
-static int                 g_entCount = 0, g_candidates = 0;
+static int                 g_entCount = 0, g_candidates = 0, g_saneEnts = 0;
 static int                 g_scrW = 0, g_scrH = 0;
 
 static bool WorldToScreen(const Vec3& w, Vec2& out) {
@@ -166,6 +184,7 @@ static void Update() {
     g_players.clear();
     g_status.clear();
     g_candidates = 0;
+    g_saneEnts   = 0;
     g_cam.valid  = false;
 
     g_game = Read<uintptr_t>(g_base + g_off.Game);
@@ -202,6 +221,7 @@ static void Update() {
 
         Vec3 pos = Read<Vec3>(ent + g_off.EntityPosition);
         if (!Finite(pos) || (pos.x == 0.f && pos.y == 0.f && pos.z == 0.f)) continue;
+        g_saneEnts++;
 
         Vec3 d{ pos.x - g_cam.pos.x, pos.y - g_cam.pos.y, pos.z - g_cam.pos.z };
         float dist = sqrtf(d.x * d.x + d.y * d.y + d.z * d.z);
@@ -304,8 +324,9 @@ static void Draw(HDC dc, int w, int h) {
         swprintf_s(buf, L"game  %llX", (unsigned long long)g_game);          lines.push_back(buf);
         swprintf_s(buf, L"world %llX", (unsigned long long)g_world);         lines.push_back(buf);
         swprintf_s(buf, L"local %llX", (unsigned long long)g_local);         lines.push_back(buf);
-        swprintf_s(buf, L"ents %d | cand %d | players %d",
-                   g_entCount, g_candidates, (int)g_players.size());         lines.push_back(buf);
+        swprintf_s(buf, L"ents %d | sane %d | cand %d | players %d",
+                   g_entCount, g_saneEnts, g_candidates, (int)g_players.size());
+        lines.push_back(buf);
         swprintf_s(buf, L"cam %.1f %.1f %.1f", g_cam.pos.x, g_cam.pos.y, g_cam.pos.z);
         lines.push_back(buf);
         lines.push_back(g_status.empty() ? L"status OK" : g_status);
@@ -318,7 +339,6 @@ static void Draw(HDC dc, int w, int h) {
             lines.push_back(buf);
         }
         lines.push_back(L"F1 esp  F2 debug  F3 hunt  F4 apply");
-        
 
         int y = 8;
         for (auto& l : lines) { Text(dc, 10, y, l, RGB(0, 220, 255)); y += 17; }
@@ -402,7 +422,6 @@ static DWORD WINAPI MainThread(LPVOID) {
             g_off.Game = g_gameHits[idx % g_gameHits.size()];
             idx++;
         }
-        
 
         Update();
         InvalidateRect(g_hwnd, nullptr, FALSE);
