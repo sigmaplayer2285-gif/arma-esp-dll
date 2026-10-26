@@ -49,19 +49,24 @@ static uintptr_t g_base = 0;
 template <typename T>
 static inline T Read(uintptr_t a) {
     if (a < 0x10000 || a > 0x7FFFFFFFFFFFull) return T{};
-    return *reinterpret_cast<T*>(a);
+    __try {
+        return *reinterpret_cast<T*>(a);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return T{};
+    }
 }
 // ---------------- offset hunter ----------------
 static std::vector<uintptr_t> g_gameHits;
 
-static bool Readable(uintptr_t p) {
+static bool Readable(uintptr_t p, size_t size) {
     if (p < 0x10000 || p > 0x7FFFFFFFFFFFull) return false;
     if (p & 0x7) return false;
     MEMORY_BASIC_INFORMATION mbi{};
     if (!VirtualQuery(reinterpret_cast<LPCVOID>(p), &mbi, sizeof(mbi))) return false;
     if (mbi.State != MEM_COMMIT) return false;
     if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) return false;
-    return true;
+    uintptr_t end = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+    return p + size <= end;
 }
 
 // Walk the known member chain from every 8-byte-aligned value in the module.
@@ -73,32 +78,42 @@ static void HuntGame() {
     auto dos = reinterpret_cast<PIMAGE_DOS_HEADER>(g_base);
     if (dos->e_magic != IMAGE_DOS_SIGNATURE) return;
     auto nt = reinterpret_cast<PIMAGE_NT_HEADERS>(g_base + dos->e_lfanew);
-    size_t imgSize = nt->OptionalHeader.SizeOfImage;
 
-    for (size_t off = 0; off + sizeof(uintptr_t) <= imgSize; off += sizeof(uintptr_t)) {
-        uintptr_t v = Read<uintptr_t>(g_base + off);
-        if (!Readable(v)) continue;
+    auto sec = IMAGE_FIRST_SECTION(nt);
+    for (int s = 0; s < nt->FileHeader.NumberOfSections; ++s) {
+        if (!(sec[s].Characteristics & IMAGE_SCN_MEM_WRITE)) continue;
+        size_t vsec = sec[s].Misc.VirtualSize;
+        if (vsec < 8) continue;
 
-        uintptr_t w = Read<uintptr_t>(v + g_off.GameWorld);
-        if (!Readable(w)) continue;
+        uintptr_t start = g_base + sec[s].VirtualAddress;
 
-        uintptr_t cw = Read<uintptr_t>(w + g_off.LocalPlayerController);
-        if (!Readable(cw)) continue;
+        for (size_t off = 0; off + sizeof(uintptr_t) <= vsec; off += sizeof(uintptr_t)) {
+            uintptr_t v = Read<uintptr_t>(start + off);
+            if (!Readable(v, 8)) continue;
 
-        uintptr_t c = Read<uintptr_t>(cw + g_off.WeakPtr);
-        if (!Readable(c)) continue;
+            uintptr_t w = Read<uintptr_t>(v + g_off.GameWorld);
+            if (!Readable(w, 8)) continue;
 
-        uintptr_t pc = Read<uintptr_t>((c - g_off.LocalPlayerDelta) + g_off.LocalPlayerCamera);
-        if (!Readable(pc)) continue;
+            uintptr_t cw = Read<uintptr_t>(w + g_off.LocalPlayerController);
+            if (!Readable(cw, 8)) continue;
 
-        Vec3 pos = Read<Vec3>(pc + g_off.CameraPosition);
-        Vec3 fwd = Read<Vec3>(pc + g_off.VectorViewForward);
-        if (!std::isfinite(pos.x) || !std::isfinite(pos.y) || !std::isfinite(pos.z)) continue;
-        if (!std::isfinite(fwd.x) || !std::isfinite(fwd.y) || !std::isfinite(fwd.z)) continue;
-        float mag = sqrtf(pos.x * pos.x + pos.y * pos.y + pos.z * pos.z);
-        if (mag < 1.f || mag > 200000.f) continue;
+            uintptr_t c = Read<uintptr_t>(cw + g_off.WeakPtr);
+            if (!Readable(c, 8)) continue;
 
-        g_gameHits.push_back(off);
+            uintptr_t pc = Read<uintptr_t>((c - g_off.LocalPlayerDelta) + g_off.LocalPlayerCamera);
+            if (!Readable(pc, 12)) continue;
+
+            Vec3 pos = Read<Vec3>(pc + g_off.CameraPosition);
+            Vec3 fwd = Read<Vec3>(pc + g_off.VectorViewForward);
+            if (!std::isfinite(pos.x) || !std::isfinite(pos.y) || !std::isfinite(pos.z)) continue;
+            if (!std::isfinite(fwd.x) || !std::isfinite(fwd.y) || !std::isfinite(fwd.z)) continue;
+
+            float mag = sqrtf(pos.x * pos.x + pos.y * pos.y + pos.z * pos.z);
+            if (mag < 1.f || mag > 200000.f) continue;
+
+            g_gameHits.push_back(sec[s].VirtualAddress + off);
+            if (g_gameHits.size() >= 24) break;
+        }
         if (g_gameHits.size() >= 24) break;
     }
 }
