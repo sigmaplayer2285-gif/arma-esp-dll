@@ -1,0 +1,32 @@
+name: build-dll
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up MSVC x64
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Compile DLL
+        run: >
+          cl /nologo /O2 /MT /EHsc /std:c++17 /DWIN32 /DWINDOWS /DNOMINMAX
+          /LD esp_loader.cpp
+          /link /OUT:esp_loader.dll user32.lib gdi32.lib
+
+      - name: Verify architecture
+        run: dumpbin /headers esp_loader.dll | findstr machine
+
+      - name: Upload dll
+        uses: actions/upload-artifact@v4
+        with:
+          name: esp-loader-dll
+          path: esp_loader.dll
