@@ -3,8 +3,10 @@
 #define NOMINMAX
 #include <windows.h>
 #include <cstdint>
+#include <cstddef>
 #include <cstdio>
 #include <cwchar>
+#include <cstring>
 #include <cmath>
 #include <atomic>
 #include <string>
@@ -59,14 +61,22 @@ struct Offsets {
 // ---------------- memory: in-process, plain dereference ----------------
 static uintptr_t g_base = 0;
 
+// plain function, no template -> no C2712
+static inline bool SafeReadRaw(uintptr_t a, void* dst, size_t n) {
+    __try {
+        memcpy(dst, reinterpret_cast<const void*>(a), n);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
 template <typename T>
 static inline T Read(uintptr_t a) {
     if (a < 0x10000 || a > 0x7FFFFFFFFFFFull) return T{};
-    __try {
-        return *reinterpret_cast<T*>(a);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return T{};
-    }
+    T v{};
+    if (!SafeReadRaw(a, &v, sizeof(T))) return T{};
+    return v;
 }
 
 // ---------------- offset hunter ----------------
@@ -93,8 +103,11 @@ static void HuntGame() {
     if (dos->e_magic != IMAGE_DOS_SIGNATURE) return;
     auto nt = reinterpret_cast<PIMAGE_NT_HEADERS>(g_base + dos->e_lfanew);
 
-    auto sec = IMAGE_FIRST_SECTION(nt);
-    for (int s = 0; s < nt->FileHeader.NumberOfSections; ++s) {
+    auto sec = reinterpret_cast<PIMAGE_SECTION_HEADER>(
+        reinterpret_cast<uintptr_t>(&nt->OptionalHeader) +
+        nt->FileHeader.SizeOfOptionalHeader);
+
+    for (int s = 0; s < (int)nt->FileHeader.NumberOfSections; ++s) {
         if (!(sec[s].Characteristics & IMAGE_SCN_MEM_WRITE)) continue;
         size_t vsec = sec[s].Misc.VirtualSize;
         if (vsec < 8) continue;
@@ -260,7 +273,7 @@ static void Text(HDC dc, int x, int y, const std::wstring& s, COLORREF col) {
     if (s.empty()) return;
     HFONT old = (HFONT)SelectObject(dc, Font());
     SetBkMode(dc, TRANSPARENT);
-    SetTextColor(dc, RGB(1, 1, 1));                 // shadow - never pure black
+    SetTextColor(dc, RGB(1, 1, 1));
     TextOutW(dc, x + 1, y, s.c_str(), (int)s.size());
     TextOutW(dc, x, y + 1, s.c_str(), (int)s.size());
     SetTextColor(dc, col);
@@ -286,13 +299,14 @@ static void Fill(HDC dc, float x, float y, float w, float h, COLORREF col) {
 }
 
 static void Draw(HDC dc, int w, int h) {
-    HBRUSH bg = CreateSolidBrush(RGB(0, 0, 0));      // pure black = transparent
+    HBRUSH bg = CreateSolidBrush(RGB(0, 0, 0));
     RECT rc{ 0, 0, w, h };
     FillRect(dc, &rc, bg);
     DeleteObject(bg);
 
     if (g_espOn && g_cam.valid) {
-        for (const auto& p : g_players) {
+        for (size_t i = 0; i < g_players.size(); ++i) {
+            const Player& p = g_players[i];
             if (!p.onScreen) continue;
             float bh = fabsf(p.foot.y - p.head.y);
             if (bh < 3.f) bh = 3.f;
@@ -322,14 +336,10 @@ static void Draw(HDC dc, int w, int h) {
 
         lines.push_back(L"ESP LOADED");
 
-        swprintf_s(buf, L"base  %llX", (unsigned long long)g_base);
-        lines.push_back(buf);
-        swprintf_s(buf, L"game  %llX", (unsigned long long)g_game);
-        lines.push_back(buf);
-        swprintf_s(buf, L"world %llX", (unsigned long long)g_world);
-        lines.push_back(buf);
-        swprintf_s(buf, L"local %llX", (unsigned long long)g_local);
-        lines.push_back(buf);
+        swprintf_s(buf, L"base  %llX", (unsigned long long)g_base);   lines.push_back(buf);
+        swprintf_s(buf, L"game  %llX", (unsigned long long)g_game);   lines.push_back(buf);
+        swprintf_s(buf, L"world %llX", (unsigned long long)g_world);  lines.push_back(buf);
+        swprintf_s(buf, L"local %llX", (unsigned long long)g_local);  lines.push_back(buf);
 
         swprintf_s(buf, L"ents %d | sane %d | cand %d | players %d",
                    g_entCount, g_saneEnts, g_candidates, (int)g_players.size());
@@ -367,8 +377,8 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
         case WM_PAINT: {
             PAINTSTRUCT ps;
             HDC dc = BeginPaint(h, &ps);
-            RECT rc; GetClientRect(h, &rc);
-            Draw(dc, rc.right, rc.bottom);
+            RECT cr; GetClientRect(h, &cr);
+            Draw(dc, cr.right, cr.bottom);
             EndPaint(h, &ps);
             return 0;
         }
