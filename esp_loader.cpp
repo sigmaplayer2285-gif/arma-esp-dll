@@ -4,6 +4,7 @@
 #include <windows.h>
 #include <cstdint>
 #include <cstdio>
+#include <cwchar>
 #include <cmath>
 #include <atomic>
 #include <string>
@@ -17,6 +18,22 @@ static bool  g_espOn     = true;
 static bool  g_showDebug = true;
 static float g_maxDist   = 800.f;
 static float g_aimHeight = 1.72f;
+
+// ---------------- math ----------------
+struct Vec2 { float x = 0, y = 0; };
+struct Vec3 { float x = 0, y = 0, z = 0; };
+
+struct Player {
+    float dist = 0.f, hp = 0.f, hpMax = 0.f;
+    bool  onScreen = false;
+    Vec2  head, foot;
+};
+
+struct Camera {
+    Vec3 pos, right, up, fwd;
+    float fov = 1.15f;
+    bool  valid = false;
+};
 
 // ---------------- offsets (same keys as your offsets.ini) ----------------
 struct Offsets {
@@ -38,10 +55,6 @@ struct Offsets {
     uintptr_t Health                = 0x44;
     uintptr_t MaxHealth             = 0x40;
 } g_off;
-
-// ---------------- math ----------------
-struct Vec2 { float x = 0, y = 0; };
-struct Vec3 { float x = 0, y = 0, z = 0; };
 
 // ---------------- memory: in-process, plain dereference ----------------
 static uintptr_t g_base = 0;
@@ -135,19 +148,7 @@ static void HuntGame() {
     }
 }
 
-// ---------------- state ----------------
-struct Player {
-    float dist = 0.f, hp = 0.f, hpMax = 0.f;
-    bool  onScreen = false;
-    Vec2  head, foot;
-};
-
-struct Camera {
-    Vec3 pos, right, up, fwd;
-    float fov = 1.15f;
-    bool  valid = false;
-};
-
+// ---------------- globals ----------------
 static HMODULE             g_hSelf    = nullptr;
 static HWND                g_hwnd     = nullptr;
 static std::atomic<bool>   g_running{ false };
@@ -159,6 +160,10 @@ static std::wstring        g_status;
 static uintptr_t           g_game = 0, g_world = 0, g_local = 0;
 static int                 g_entCount = 0, g_candidates = 0, g_saneEnts = 0;
 static int                 g_scrW = 0, g_scrH = 0;
+
+static bool Finite(const Vec3& v) {
+    return std::isfinite(v.x) && std::isfinite(v.y) && std::isfinite(v.z);
+}
 
 static bool WorldToScreen(const Vec3& w, Vec2& out) {
     if (!g_cam.valid || g_scrW < 1 || g_scrH < 1) return false;
@@ -173,10 +178,6 @@ static bool WorldToScreen(const Vec3& w, Vec2& out) {
     out.x = (g_scrW * 0.5f) * (1.f + (x / z) / tanX);
     out.y = (g_scrH * 0.5f) * (1.f - (y / z) / tanY);
     return true;
-}
-
-static bool Finite(const Vec3& v) {
-    return std::isfinite(v.x) && std::isfinite(v.y) && std::isfinite(v.z);
 }
 
 // ---------------- chain ----------------
@@ -309,9 +310,9 @@ static void Draw(HDC dc, int w, int h) {
                 Fill(dc, bx - 6.f, by + bh * (1.f - frac), 3.f, bh * frac, RGB(0, 255, 130));
             }
 
-            wchar_t buf[32];
-            swprintf_s(buf, L"%dm", (int)p.dist);
-            Text(dc, (int)(bx + bw * 0.5f) - 14, (int)(by + bh + 2), buf, RGB(205, 205, 205));
+            wchar_t nbuf[32];
+            swprintf_s(nbuf, L"%dm", (int)p.dist);
+            Text(dc, (int)(bx + bw * 0.5f) - 14, (int)(by + bh + 2), nbuf, RGB(205, 205, 205));
         }
     }
 
@@ -320,28 +321,42 @@ static void Draw(HDC dc, int w, int h) {
         wchar_t buf[256];
 
         lines.push_back(L"ESP LOADED");
-        swprintf_s(buf, L"base  %llX", (unsigned long long)g_base);          lines.push_back(buf);
-        swprintf_s(buf, L"game  %llX", (unsigned long long)g_game);          lines.push_back(buf);
-        swprintf_s(buf, L"world %llX", (unsigned long long)g_world);         lines.push_back(buf);
-        swprintf_s(buf, L"local %llX", (unsigned long long)g_local);         lines.push_back(buf);
+
+        swprintf_s(buf, L"base  %llX", (unsigned long long)g_base);
+        lines.push_back(buf);
+        swprintf_s(buf, L"game  %llX", (unsigned long long)g_game);
+        lines.push_back(buf);
+        swprintf_s(buf, L"world %llX", (unsigned long long)g_world);
+        lines.push_back(buf);
+        swprintf_s(buf, L"local %llX", (unsigned long long)g_local);
+        lines.push_back(buf);
+
         swprintf_s(buf, L"ents %d | sane %d | cand %d | players %d",
                    g_entCount, g_saneEnts, g_candidates, (int)g_players.size());
         lines.push_back(buf);
-        swprintf_s(buf, L"cam %.1f %.1f %.1f", g_cam.pos.x, g_cam.pos.y, g_cam.pos.z);
+
+        swprintf_s(buf, L"cam %.1f %.1f %.1f",
+                   (double)g_cam.pos.x, (double)g_cam.pos.y, (double)g_cam.pos.z);
         lines.push_back(buf);
+
         lines.push_back(g_status.empty() ? L"status OK" : g_status);
 
         swprintf_s(buf, L"Game off = 0x%llX", (unsigned long long)g_off.Game);
         lines.push_back(buf);
+
         if (!g_gameHits.empty()) {
             swprintf_s(buf, L"HITS %d  first 0x%llX  (F4 = try next)",
                        (int)g_gameHits.size(), (unsigned long long)g_gameHits[0]);
             lines.push_back(buf);
         }
+
         lines.push_back(L"F1 esp  F2 debug  F3 hunt  F4 apply");
 
         int y = 8;
-        for (auto& l : lines) { Text(dc, 10, y, l, RGB(0, 220, 255)); y += 17; }
+        for (size_t i = 0; i < lines.size(); ++i) {
+            Text(dc, 10, y, lines[i], RGB(0, 220, 255));
+            y += 17;
+        }
     }
 }
 
