@@ -66,6 +66,50 @@ static uintptr_t g_foundPos = 0;
 static int       g_posSpread = 0;
 static float     g_posBox = 0.f;
 static void RescanEntityPosition();
+static bool UnitVec(const Vec3& v) {
+    float m = v.x * v.x + v.y * v.y + v.z * v.z;
+    return m > 0.90f && m < 1.10f;
+}
+static float Dot3(const Vec3& a, const Vec3& b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+
+static bool FindCameraBasis(uintptr_t obj) {
+    for (uintptr_t o = 0x18; o < 0x600; o += 4) {
+        Vec3 r = Read<Vec3>(obj + o);
+        Vec3 u = Read<Vec3>(obj + o + 0x0C);
+        Vec3 f = Read<Vec3>(obj + o + 0x18);
+        if (!UnitVec(r) || !UnitVec(u) || !UnitVec(f)) continue;
+        if (fabsf(Dot3(r, u)) > 0.15f || fabsf(Dot3(r, f)) > 0.15f ||
+            fabsf(Dot3(u, f)) > 0.15f) continue;
+
+        Vec3 p = Read<Vec3>(obj + o - 0x18);
+        if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) continue;
+        if (p.x == 0.f && p.y == 0.f && p.z == 0.f) continue;
+        if (fabsf(p.x) > 1.0e6f || fabsf(p.y) > 1.0e6f || fabsf(p.z) > 1.0e6f) continue;
+
+        g_off.CameraPosition    = o - 0x18;
+        g_off.InvertedViewRight = o;
+        g_off.InvertedViewUp    = o + 0x0C;
+        g_off.VectorViewForward = o + 0x18;
+        g_camRight = o;
+        return true;
+    }
+    return false;
+}
+
+static void FixCamera() {
+    g_camRight = 0;
+    uintptr_t pc = g_local;
+    if (!pc) return;
+    if (FindCameraBasis(pc)) { RescanEntityPosition(); return; }
+
+    for (uintptr_t o = 0; o < 0x600; o += 8) {
+        uintptr_t sub = Read<uintptr_t>(pc + o);
+        if (!sub || sub < 0x10000) continue;
+        if (FindCameraBasis(sub)) { RescanEntityPosition(); return; }
+    }
+}
+static uintptr_t g_camRight = 0;
+static void FixCamera();
 
 // ---------------- memory ----------------
 static uintptr_t g_base = 0;
@@ -357,6 +401,7 @@ static void Update() {
 
         Vec3 pos = Read<Vec3>(ent + g_off.EntityPosition);
         if (!Finite(pos) || (pos.x == 0.f && pos.y == 0.f && pos.z == 0.f)) continue;
+        if (fabsf(pos.x) > 1.0e7f || fabsf(pos.y) > 1.0e7f || fabsf(pos.z) > 1.0e7f) continue;
         g_saneEnts++;
 
         Vec3 d{ pos.x - g_cam.pos.x, pos.y - g_cam.pos.y, pos.z - g_cam.pos.z };
@@ -499,6 +544,9 @@ static void Draw(HDC dc, int w, int h) {
         lines.push_back(buf);
 
         swprintf_s(buf, L"rescan 0x%llX spread %d box %.1f",
+            swprintf_s(buf, L"camOff 0x%llX  right 0x%llX",
+                   (unsigned long long)g_off.CameraPosition, (unsigned long long)g_camRight);
+        lines.push_back(buf);
                    (unsigned long long)g_foundPos, g_posSpread, (double)g_posBox);
         lines.push_back(buf);
 
@@ -561,53 +609,59 @@ static void RescanEntityPosition() {
     float nearLimit = 100.f;
     if (0.05f * camMag > nearLimit) nearLimit = 0.05f * camMag;
 
-    bool found = false;
-    uintptr_t bestOff = 0;
-    int bestSpread = -1;
-    float bestBox = 0.f;
+    for (int pass = 0; pass < 2; ++pass) {
+        const bool useNear = (pass == 0);
+        bool found = false;
+        uintptr_t bestOff = 0;
+        int bestSpread = -1;
+        float bestBox = 0.f;
 
-    for (uintptr_t po = 0; po < 0x400; po += 4) {
-        Vec3 first{}; bool haveFirst = false;
-        float minD = 1.0e30f;
-        float mn[3] = { 1.0e30f, 1.0e30f, 1.0e30f };
-        float mx[3] = { -1.0e30f, -1.0e30f, -1.0e30f };
-        int finite = 0, spread = 0;
+        for (uintptr_t po = 0; po < 0x400; po += 4) {
+            Vec3 first{}; bool haveFirst = false;
+            float minD = 1.0e30f;
+            float mn[3] = { 1.0e30f, 1.0e30f, 1.0e30f };
+            float mx[3] = { -1.0e30f, -1.0e30f, -1.0e30f };
+            int finite = 0, spread = 0;
 
-        for (int i = 0; i < n; ++i) {
-            Vec3 p = Read<Vec3>(ents[i] + po);
-            if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) continue;
-            if (p.x == 0.f && p.y == 0.f && p.z == 0.f) continue;
-            finite++;
-            if (p.x < mn[0]) mn[0] = p.x;
-            if (p.y < mn[1]) mn[1] = p.y;
-            if (p.z < mn[2]) mn[2] = p.z;
-            if (p.x > mx[0]) mx[0] = p.x;
-            if (p.y > mx[1]) mx[1] = p.y;
-            if (p.z > mx[2]) mx[2] = p.z;
-            float dx = p.x - g_cam.pos.x, dy = p.y - g_cam.pos.y, dz = p.z - g_cam.pos.z;
-            float dd = sqrtf(dx * dx + dy * dy + dz * dz);
-            if (dd < minD) minD = dd;
-            if (!haveFirst) { first = p; haveFirst = true; }
-            else if (fabsf(p.x - first.x) > 0.01f || fabsf(p.y - first.y) > 0.01f ||
-                     fabsf(p.z - first.z) > 0.01f)
-                spread++;
+            for (int i = 0; i < n; ++i) {
+                Vec3 p = Read<Vec3>(ents[i] + po);
+                if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) continue;
+                if (p.x == 0.f && p.y == 0.f && p.z == 0.f) continue;
+                if (fabsf(p.x) > 1.0e7f || fabsf(p.y) > 1.0e7f || fabsf(p.z) > 1.0e7f) continue;
+                finite++;
+                if (p.x < mn[0]) mn[0] = p.x;
+                if (p.y < mn[1]) mn[1] = p.y;
+                if (p.z < mn[2]) mn[2] = p.z;
+                if (p.x > mx[0]) mx[0] = p.x;
+                if (p.y > mx[1]) mx[1] = p.y;
+                if (p.z > mx[2]) mx[2] = p.z;
+                float dx = p.x - g_cam.pos.x, dy = p.y - g_cam.pos.y, dz = p.z - g_cam.pos.z;
+                float dd = sqrtf(dx * dx + dy * dy + dz * dz);
+                if (dd < minD) minD = dd;
+                if (!haveFirst) { first = p; haveFirst = true; }
+                else if (fabsf(p.x - first.x) > 0.01f || fabsf(p.y - first.y) > 0.01f ||
+                         fabsf(p.z - first.z) > 0.01f)
+                    spread++;
+            }
+
+            if (finite < n / 2) continue;
+            if (useNear && minD > nearLimit) continue;
+            if (!useNear && spread < n / 2) continue;
+
+            float bx = mx[0] - mn[0], by = mx[1] - mn[1], bz = mx[2] - mn[2];
+            float box = sqrtf(bx * bx + by * by + bz * bz);
+            if (!(box > 0.5f && box < 1.0e7f)) continue;
+
+            if (spread > bestSpread) { bestSpread = spread; bestOff = po; bestBox = box; found = true; }
         }
 
-        if (finite < n / 2) continue;
-        if (minD > nearLimit) continue;
-
-        float bx = mx[0] - mn[0], by = mx[1] - mn[1], bz = mx[2] - mn[2];
-        float box = sqrtf(bx * bx + by * by + bz * bz);
-        if (!(box > 0.5f && box < 1.0e7f)) continue;
-
-        if (spread > bestSpread) { bestSpread = spread; bestOff = po; bestBox = box; found = true; }
+        if (!found) continue;
+        g_foundPos  = bestOff;
+        g_posSpread = bestSpread;
+        g_posBox    = bestBox;
+        g_off.EntityPosition = bestOff;
+        return;
     }
-
-    if (!found) return;
-    g_foundPos  = bestOff;
-    g_posSpread = bestSpread;
-    g_posBox    = bestBox;
-    g_off.EntityPosition = bestOff;
 }
 // ---------------- window ----------------
 static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
@@ -685,6 +739,7 @@ static DWORD WINAPI MainThread(LPVOID) {
         if (KeyPressed(VK_F6)) FindHealthOffsets();
         if (KeyPressed(VK_F7)) g_noDist = !g_noDist;
         if (KeyPressed(VK_F8)) RescanEntityPosition();
+        if (KeyPressed(VK_F9)) FixCamera();
         if (KeyPressed(VK_F4) && !g_gameHits.empty()) {
             static size_t idx = 0;
             const GameHit& hh = g_gameHits[idx % g_gameHits.size()];
