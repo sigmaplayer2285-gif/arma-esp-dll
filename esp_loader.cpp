@@ -61,22 +61,12 @@ struct Offsets {
 // ---------------- memory: in-process, plain dereference ----------------
 static uintptr_t g_base = 0;
 
-// plain function, no template -> no C2712
-static inline bool SafeReadRaw(uintptr_t a, void* dst, size_t n) {
-    __try {
-        memcpy(dst, reinterpret_cast<const void*>(a), n);
-        return true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-}
+static bool Readable(uintptr_t p, size_t size);   // forward decl
 
 template <typename T>
 static inline T Read(uintptr_t a) {
-    if (a < 0x10000 || a > 0x7FFFFFFFFFFFull) return T{};
-    T v{};
-    if (!SafeReadRaw(a, &v, sizeof(T))) return T{};
-    return v;
+    if (!Readable(a, sizeof(T))) return T{};
+    return *reinterpret_cast<T*>(a);
 }
 
 // ---------------- offset hunter ----------------
