@@ -76,6 +76,9 @@ static inline T Read(uintptr_t a) {
 // ---------------- offset hunter ----------------
 static std::vector<uintptr_t> g_gameHits;
 
+static int g_hScan = 0, g_hPtr = 0, g_hWorld = 0, g_hCtrl = 0;
+static int g_hCam = 0, g_hList = 0, g_hNear = 0;
+
 static bool Readable(uintptr_t p, size_t size) {
     if (p < 0x10000 || p > 0x7FFFFFFFFFFFull) return false;
     if (p & 0x7) return false;
@@ -91,6 +94,7 @@ static bool Readable(uintptr_t p, size_t size) {
 // A hit means the camera landed on sane floats -> that value is the Game ptr.
 static void HuntGame() {
     g_gameHits.clear();
+    g_hScan = g_hPtr = g_hWorld = g_hCtrl = g_hCam = g_hList = g_hNear = 0;
     if (!g_base) return;
 
     auto dos = reinterpret_cast<PIMAGE_DOS_HEADER>(g_base);
@@ -108,14 +112,18 @@ static void HuntGame() {
         uintptr_t start = g_base + sec[s].VirtualAddress;
 
         for (size_t off = 0; off + sizeof(uintptr_t) <= vsec; off += sizeof(uintptr_t)) {
+            g_hScan++;
             uintptr_t v = Read<uintptr_t>(start + off);
             if (!Readable(v, 8)) continue;
+            g_hPtr++;
 
             uintptr_t w = Read<uintptr_t>(v + g_off.GameWorld);
             if (!Readable(w, 8)) continue;
+            g_hWorld++;
 
             uintptr_t cw = Read<uintptr_t>(w + g_off.LocalPlayerController);
             if (!Readable(cw, 8)) continue;
+            g_hCtrl++;
 
             uintptr_t c = Read<uintptr_t>(cw + g_off.WeakPtr);
             if (!Readable(c, 8)) continue;
@@ -128,25 +136,34 @@ static void HuntGame() {
             if (!std::isfinite(pos.x) || !std::isfinite(pos.y) || !std::isfinite(pos.z)) continue;
             if (!std::isfinite(fwd.x) || !std::isfinite(fwd.y) || !std::isfinite(fwd.z)) continue;
             float mag = sqrtf(pos.x * pos.x + pos.y * pos.y + pos.z * pos.z);
-            if (mag < 1.f || mag > 200000.f) continue;
+            if (mag < 1.f || mag > 1.0e7f) continue;
+            g_hCam++;
 
-            // strong test: your own player is in this list, so an entity must
-            // sit within 50 units of the camera
             uintptr_t list = Read<uintptr_t>(v + g_off.EntityList);
             int cnt = Read<int>(v + g_off.EntityCount);
-            if (!Readable(list, 8) || cnt < 1 || cnt > 20000) continue;
+            if (!Readable(list, 8) || cnt < 1 || cnt > 50000) continue;
+            g_hList++;
 
-            int lim = cnt < 256 ? cnt : 256;
-            bool nearby = false;
-            for (int i = 0; i < lim && !nearby; ++i) {
+            int lim = cnt < 128 ? cnt : 128;
+            int sane = 0;
+            float minD = 1.0e18f, sumD = 0.f;
+            for (int i = 0; i < lim; ++i) {
                 uintptr_t e = Read<uintptr_t>(list + (uintptr_t)i * sizeof(uintptr_t));
                 if (!Readable(e, 12)) continue;
                 Vec3 ep = Read<Vec3>(e + g_off.EntityPosition);
                 if (!std::isfinite(ep.x) || !std::isfinite(ep.y) || !std::isfinite(ep.z)) continue;
+                if (ep.x == 0.f && ep.y == 0.f && ep.z == 0.f) continue;
                 float dx = ep.x - pos.x, dy = ep.y - pos.y, dz = ep.z - pos.z;
-                if (dx * dx + dy * dy + dz * dz < 2500.f) nearby = true;
+                float dd = sqrtf(dx * dx + dy * dy + dz * dz);
+                if (dd < minD) minD = dd;
+                sumD += dd;
+                sane++;
             }
-            if (!nearby) continue;
+            if (sane < 2) continue;
+
+            float avgD = sumD / (float)sane;
+            if (!(minD < 50.f || minD < 0.1f * avgD)) continue;
+            g_hNear++;
 
             g_gameHits.push_back(sec[s].VirtualAddress + off);
             if (g_gameHits.size() >= 24) break;
@@ -154,6 +171,7 @@ static void HuntGame() {
         if (g_gameHits.size() >= 24) break;
     }
 }
+   
 
 // ---------------- globals ----------------
 static HMODULE             g_hSelf    = nullptr;
@@ -346,6 +364,9 @@ static void Draw(HDC dc, int w, int h) {
         lines.push_back(g_status.empty() ? L"status OK" : g_status);
 
         swprintf_s(buf, L"Game off = 0x%llX", (unsigned long long)g_off.Game);
+        lines.push_back(buf);
+        swprintf_s(buf, L"hunt: scan %d ptr %d wld %d ctl %d cam %d lst %d nrd %d",
+                   g_hScan, g_hPtr, g_hWorld, g_hCtrl, g_hCam, g_hList, g_hNear);
         lines.push_back(buf);
 
         if (!g_gameHits.empty()) {
