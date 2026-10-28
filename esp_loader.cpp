@@ -1,4 +1,4 @@
-// esp_loader.cpp - stage 3: self-searching offsets
+// esp_loader.cpp - stage 4: health chain hunt
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
@@ -15,10 +15,11 @@
 #pragma comment(lib, "user32.lib")
 
 // ---------------- config ----------------
-static bool  g_espOn     = true;
-static bool  g_showDebug = true;
-static float g_maxDist   = 800.f;
-static float g_aimHeight = 1.72f;
+static bool  g_espOn      = true;
+static bool  g_showDebug  = true;
+static bool  g_needHealth = true;
+static float g_maxDist    = 800.f;
+static float g_aimHeight  = 1.72f;
 
 // ---------------- math ----------------
 struct Vec2 { float x = 0, y = 0; };
@@ -88,6 +89,54 @@ static bool Readable(uintptr_t p, size_t size) {
     return p + size <= end;
 }
 
+// ---------------- globals ----------------
+static HMODULE             g_hSelf    = nullptr;
+static HWND                g_hwnd     = nullptr;
+static std::atomic<bool>   g_running{ false };
+static HFONT               g_font     = nullptr;
+
+static Camera              g_cam;
+static std::vector<Player> g_players;
+static std::wstring        g_status;
+static uintptr_t           g_game = 0, g_world = 0, g_local = 0;
+static int                 g_entCount = 0, g_candidates = 0, g_saneEnts = 0;
+static int                 g_distOk = 0, g_h1Ok = 0, g_h2Ok = 0, g_hpOk = 0;
+static int                 g_scrW = 0, g_scrH = 0;
+
+static bool Finite(const Vec3& v) {
+    return std::isfinite(v.x) && std::isfinite(v.y) && std::isfinite(v.z);
+}
+
+static bool WorldToScreen(const Vec3& w, Vec2& out) {
+    if (!g_cam.valid || g_scrW < 1 || g_scrH < 1) return false;
+    Vec3 d{ w.x - g_cam.pos.x, w.y - g_cam.pos.y, w.z - g_cam.pos.z };
+    float x = d.x * g_cam.right.x + d.y * g_cam.right.y + d.z * g_cam.right.z;
+    float y = d.x * g_cam.up.x    + d.y * g_cam.up.y    + d.z * g_cam.up.z;
+    float z = d.x * g_cam.fwd.x   + d.y * g_cam.fwd.y   + d.z * g_cam.fwd.z;
+    if (z <= 0.05f) return false;
+    float tanY = tanf(g_cam.fov * 0.5f);
+    if (tanY < 1e-6f) return false;
+    float tanX = tanY * ((float)g_scrW / (float)g_scrH);
+    out.x = (g_scrW * 0.5f) * (1.f + (x / z) / tanX);
+    out.y = (g_scrH * 0.5f) * (1.f - (y / z) / tanY);
+    return true;
+}
+
+// ---------------- health pair test ----------------
+static bool HealthPairOk(uintptr_t ent, uintptr_t c1, uintptr_t c2, uintptr_t hpOff,
+                         float& hpOut, float& maxOut) {
+    uintptr_t h1 = Read<uintptr_t>(ent + c1);
+    if (!h1) return false;
+    uintptr_t h2 = Read<uintptr_t>(h1 + c2);
+    if (!h2) return false;
+    float hp    = Read<float>(h2 + hpOff);
+    float hpMax = Read<float>(h2 + hpOff - 4);
+    if (!(hpMax > 0.1f && hpMax < 1000000.f)) return false;
+    if (!(hp > 0.f && hp <= hpMax * 1.05f)) return false;
+    hpOut = hp; maxOut = hpMax;
+    return true;
+}
+
 // ---------------- hunter ----------------
 struct GameHit {
     uintptr_t game;
@@ -98,9 +147,8 @@ struct GameHit {
 
 static std::vector<GameHit> g_gameHits;
 static int g_hScan = 0, g_hPtr = 0, g_hWorld = 0, g_hCtrl = 0, g_hCam = 0, g_hEnt = 0;
+static uintptr_t g_fC1 = 0, g_fC2 = 0, g_fHp = 0;
 
-// Search the world for an offset that behaves like an entity pointer array
-// whose entries hold positions sitting right next to the camera.
 static bool SearchEntityOffsets(uintptr_t world, const Vec3& cam,
                                 uintptr_t& oList, uintptr_t& oPos, uintptr_t& oCnt) {
     uintptr_t bestList = 0, bestPos = 0;
@@ -127,7 +175,6 @@ static bool SearchEntityOffsets(uintptr_t world, const Vec3& cam,
                 sane++;
             }
             if (sane < 8) continue;
-
             if (sane > bestSane) { bestSane = sane; bestList = lo; bestPos = po; }
 
             float avgD = sumD / (float)sane;
@@ -141,8 +188,6 @@ static bool SearchEntityOffsets(uintptr_t world, const Vec3& cam,
             return true;
         }
     }
-
-    // nothing matched the proximity test - fall back to the densest hit
     if (bestSane >= 32) {
         oList = bestList; oPos = bestPos; oCnt = 0;
         for (uintptr_t co = 8; co < 0x400; co += 4) {
@@ -152,6 +197,54 @@ static bool SearchEntityOffsets(uintptr_t world, const Vec3& cam,
         return true;
     }
     return false;
+}
+
+// Search the health chain. Characters share a max health value, so we require
+// several hits to agree on it - that kills the coincidences.
+static void FindHealthOffsets() {
+    g_fC1 = g_fC2 = g_fHp = 0;
+    if (!g_world || !g_cam.valid) return;
+
+    uintptr_t list = Read<uintptr_t>(g_world + g_off.EntityList);
+    int count = Read<int>(g_world + g_off.EntityCount);
+    if (!list || count <= 0) return;
+    if (count > 4096) count = 4096;
+
+    std::vector<uintptr_t> sample;
+    for (int i = 0; i < count && sample.size() < 64; ++i) {
+        uintptr_t e = Read<uintptr_t>(list + (uintptr_t)i * sizeof(uintptr_t));
+        if (!e || e < 0x10000) continue;
+        Vec3 p = Read<Vec3>(e + g_off.EntityPosition);
+        if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) continue;
+        float dx = p.x - g_cam.pos.x, dy = p.y - g_cam.pos.y, dz = p.z - g_cam.pos.z;
+        if (sqrtf(dx * dx + dy * dy + dz * dz) > g_maxDist) continue;
+        sample.push_back(e);
+    }
+    if (sample.size() < 4) return;
+
+    for (uintptr_t c1 = 0; c1 < 0x300; c1 += 8) {
+        for (uintptr_t c2 = 0; c2 < 0x200; c2 += 8) {
+            for (uintptr_t hp = 4; hp < 0x80; hp += 4) {
+                int good = 0, sameMax = 0;
+                float firstMax = 0.f;
+                for (size_t i = 0; i < sample.size(); ++i) {
+                    float a, b;
+                    if (!HealthPairOk(sample[i], c1, c2, hp, a, b)) continue;
+                    good++;
+                    if (firstMax == 0.f) firstMax = b;
+                    else if (fabsf(b - firstMax) < 0.02f * firstMax) sameMax++;
+                }
+                if (good >= 4 && sameMax >= 3) {
+                    g_fC1 = c1; g_fC2 = c2; g_fHp = hp;
+                    g_off.HealthChain1 = c1;
+                    g_off.HealthChain2 = c2;
+                    g_off.Health    = hp;
+                    g_off.MaxHealth = hp - 4;
+                    return;
+                }
+            }
+        }
+    }
 }
 
 static void HuntGame() {
@@ -213,44 +306,12 @@ static void HuntGame() {
     }
 }
 
-// ---------------- globals ----------------
-static HMODULE             g_hSelf    = nullptr;
-static HWND                g_hwnd     = nullptr;
-static std::atomic<bool>   g_running{ false };
-static HFONT               g_font     = nullptr;
-
-static Camera              g_cam;
-static std::vector<Player> g_players;
-static std::wstring        g_status;
-static uintptr_t           g_game = 0, g_world = 0, g_local = 0;
-static int                 g_entCount = 0, g_candidates = 0, g_saneEnts = 0;
-static int                 g_scrW = 0, g_scrH = 0;
-
-static bool Finite(const Vec3& v) {
-    return std::isfinite(v.x) && std::isfinite(v.y) && std::isfinite(v.z);
-}
-
-static bool WorldToScreen(const Vec3& w, Vec2& out) {
-    if (!g_cam.valid || g_scrW < 1 || g_scrH < 1) return false;
-    Vec3 d{ w.x - g_cam.pos.x, w.y - g_cam.pos.y, w.z - g_cam.pos.z };
-    float x = d.x * g_cam.right.x + d.y * g_cam.right.y + d.z * g_cam.right.z;
-    float y = d.x * g_cam.up.x    + d.y * g_cam.up.y    + d.z * g_cam.up.z;
-    float z = d.x * g_cam.fwd.x   + d.y * g_cam.fwd.y   + d.z * g_cam.fwd.z;
-    if (z <= 0.05f) return false;
-    float tanY = tanf(g_cam.fov * 0.5f);
-    if (tanY < 1e-6f) return false;
-    float tanX = tanY * ((float)g_scrW / (float)g_scrH);
-    out.x = (g_scrW * 0.5f) * (1.f + (x / z) / tanX);
-    out.y = (g_scrH * 0.5f) * (1.f - (y / z) / tanY);
-    return true;
-}
-
 // ---------------- chain ----------------
 static void Update() {
     g_players.clear();
     g_status.clear();
     g_candidates = 0;
-    g_saneEnts   = 0;
+    g_saneEnts = g_distOk = g_h1Ok = g_h2Ok = g_hpOk = 0;
     g_cam.valid  = false;
 
     g_game = Read<uintptr_t>(g_base + g_off.Game);
@@ -292,15 +353,24 @@ static void Update() {
         Vec3 d{ pos.x - g_cam.pos.x, pos.y - g_cam.pos.y, pos.z - g_cam.pos.z };
         float dist = sqrtf(d.x * d.x + d.y * d.y + d.z * d.z);
         if (dist > g_maxDist || dist < 0.05f) continue;
+        g_distOk++;
 
-        uintptr_t h1 = Read<uintptr_t>(ent + g_off.HealthChain1);
-        if (!h1) continue;
-        uintptr_t h2 = Read<uintptr_t>(h1 + g_off.HealthChain2);
-        if (!h2) continue;
-        float hp    = Read<float>(h2 + g_off.Health);
-        float hpMax = Read<float>(h2 + g_off.MaxHealth);
-        if (!(hpMax > 1.f && hpMax < 10000.f)) continue;
-        if (!(hp > 0.f && hp <= hpMax)) continue;
+        float hp = 0.f, hpMax = 0.f;
+        if (g_needHealth) {
+            uintptr_t h1 = Read<uintptr_t>(ent + g_off.HealthChain1);
+            if (!h1) continue;
+            g_h1Ok++;
+            uintptr_t h2 = Read<uintptr_t>(h1 + g_off.HealthChain2);
+            if (!h2) continue;
+            g_h2Ok++;
+            hp    = Read<float>(h2 + g_off.Health);
+            hpMax = Read<float>(h2 + g_off.MaxHealth);
+            if (!(hpMax > 0.1f && hpMax < 1000000.f)) continue;
+            if (!(hp > 0.f && hp <= hpMax * 1.05f)) continue;
+            g_hpOk++;
+        } else {
+            hpMax = 100.f; hp = 100.f;
+        }
         g_candidates++;
 
         Player p;
@@ -393,8 +463,9 @@ static void Draw(HDC dc, int w, int h) {
         swprintf_s(buf, L"world %llX", (unsigned long long)g_world);  lines.push_back(buf);
         swprintf_s(buf, L"local %llX", (unsigned long long)g_local);  lines.push_back(buf);
 
-        swprintf_s(buf, L"ents %d | sane %d | cand %d | players %d",
-                   g_entCount, g_saneEnts, g_candidates, (int)g_players.size());
+        swprintf_s(buf, L"ents %d | sane %d | dist %d | h1 %d | h2 %d | hp %d | cand %d | players %d",
+                   g_entCount, g_saneEnts, g_distOk, g_h1Ok, g_h2Ok, g_hpOk,
+                   g_candidates, (int)g_players.size());
         lines.push_back(buf);
 
         swprintf_s(buf, L"cam %.1f %.1f %.1f",
@@ -403,25 +474,25 @@ static void Draw(HDC dc, int w, int h) {
 
         lines.push_back(g_status.empty() ? L"status OK" : g_status);
 
-        swprintf_s(buf, L"Game off 0x%llX  list 0x%llX  pos 0x%llX  cnt 0x%llX",
+        swprintf_s(buf, L"G 0x%llX L 0x%llX P 0x%llX C 0x%llX  hc1 0x%llX hc2 0x%llX hp 0x%llX",
                    (unsigned long long)g_off.Game, (unsigned long long)g_off.EntityList,
-                   (unsigned long long)g_off.EntityPosition, (unsigned long long)g_off.EntityCount);
+                   (unsigned long long)g_off.EntityPosition, (unsigned long long)g_off.EntityCount,
+                   (unsigned long long)g_off.HealthChain1, (unsigned long long)g_off.HealthChain2,
+                   (unsigned long long)g_off.Health);
         lines.push_back(buf);
 
         swprintf_s(buf, L"hunt scan %d ptr %d wld %d ctl %d cam %d ent %d",
                    g_hScan, g_hPtr, g_hWorld, g_hCtrl, g_hCam, g_hEnt);
         lines.push_back(buf);
 
-        if (!g_gameHits.empty()) {
-            const GameHit& h = g_gameHits[0];
-            swprintf_s(buf, L"HITS %d  g 0x%llX list 0x%llX pos 0x%llX cnt 0x%llX  (F4)",
-                       (int)g_gameHits.size(), (unsigned long long)h.game,
-                       (unsigned long long)h.listOff, (unsigned long long)h.posOff,
-                       (unsigned long long)h.cntOff);
+        if (g_fHp) {
+            swprintf_s(buf, L"HEALTH FOUND c1 0x%llX c2 0x%llX hp 0x%llX",
+                       (unsigned long long)g_fC1, (unsigned long long)g_fC2,
+                       (unsigned long long)g_fHp);
             lines.push_back(buf);
         }
 
-        lines.push_back(L"F1 esp  F2 debug  F3 hunt  F4 apply");
+        lines.push_back(L"F1 esp  F2 debug  F3 hunt  F4 apply  F5 health  F6 find-health");
 
         int y = 8;
         for (size_t i = 0; i < lines.size(); ++i) {
@@ -500,16 +571,18 @@ static DWORD WINAPI MainThread(LPVOID) {
             g_scrH = cr.bottom;
         }
 
-        if (KeyPressed(VK_F1)) g_espOn     = !g_espOn;
-        if (KeyPressed(VK_F2)) g_showDebug = !g_showDebug;
+        if (KeyPressed(VK_F1)) g_espOn      = !g_espOn;
+        if (KeyPressed(VK_F2)) g_showDebug  = !g_showDebug;
+        if (KeyPressed(VK_F5)) g_needHealth = !g_needHealth;
         if (KeyPressed(VK_F3)) HuntGame();
+        if (KeyPressed(VK_F6)) FindHealthOffsets();
         if (KeyPressed(VK_F4) && !g_gameHits.empty()) {
             static size_t idx = 0;
-            const GameHit& h = g_gameHits[idx % g_gameHits.size()];
-            g_off.Game           = h.game;
-            if (h.listOff) g_off.EntityList     = h.listOff;
-            if (h.posOff)  g_off.EntityPosition = h.posOff;
-            if (h.cntOff)  g_off.EntityCount    = h.cntOff;
+            const GameHit& hh = g_gameHits[idx % g_gameHits.size()];
+            g_off.Game           = hh.game;
+            if (hh.listOff) g_off.EntityList     = hh.listOff;
+            if (hh.posOff)  g_off.EntityPosition = hh.posOff;
+            if (hh.cntOff)  g_off.EntityCount    = hh.cntOff;
             idx++;
         }
 
