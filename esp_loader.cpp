@@ -1,6 +1,10 @@
 // esp_loader.cpp - stage 2: chain + ESP + debug readout
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
 #include <windows.h>
 #include <cstdint>
 #include <cstddef>
@@ -133,7 +137,7 @@ static void HuntGame() {
             if (!Readable(list, 8) || cnt < 1 || cnt > 20000) continue;
 
             int lim = cnt < 256 ? cnt : 256;
-            bool near = false;
+            bool nearby = false;
             for (int i = 0; i < lim && !near; ++i) {
                 uintptr_t e = Read<uintptr_t>(list + (uintptr_t)i * sizeof(uintptr_t));
                 if (!Readable(e, 12)) continue;
@@ -142,7 +146,7 @@ static void HuntGame() {
                 float dx = ep.x - pos.x, dy = ep.y - pos.y, dz = ep.z - pos.z;
                 if (dx * dx + dy * dy + dz * dz < 2500.f) near = true;
             }
-            if (!near) continue;
+            if (!nearby) continue;
 
             g_gameHits.push_back(sec[s].VirtualAddress + off);
             if (g_gameHits.size() >= 24) break;
