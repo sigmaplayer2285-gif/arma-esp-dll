@@ -58,6 +58,15 @@ struct Offsets {
     uintptr_t MaxHealth             = 0x40;
 } g_off;
 
+// ---- stage 5 diagnostics ----
+static bool      g_noDist = false;
+static float     g_dMin = 1.0e9f, g_dMax = -1.0e9f;
+static float     g_dump[3][3] = {};
+static uintptr_t g_foundPos = 0;
+static int       g_posSpread = 0;
+static float     g_posBox = 0.f;
+static void RescanEntityPosition();
+
 // ---------------- memory ----------------
 static uintptr_t g_base = 0;
 
@@ -352,7 +361,13 @@ static void Update() {
 
         Vec3 d{ pos.x - g_cam.pos.x, pos.y - g_cam.pos.y, pos.z - g_cam.pos.z };
         float dist = sqrtf(d.x * d.x + d.y * d.y + d.z * d.z);
-        if (dist > g_maxDist || dist < 0.05f) continue;
+        if (dist < g_dMin) g_dMin = dist;
+        if (dist > g_dMax) g_dMax = dist;
+        if (g_saneEnts >= 1 && g_saneEnts <= 3) {
+            int k = g_saneEnts - 1;
+            g_dump[k][0] = pos.x; g_dump[k][1] = pos.y; g_dump[k][2] = pos.z;
+        }
+        if (!g_noDist && (dist > g_maxDist || dist < 0.05f)) continue;
         g_distOk++;
 
         float hp = 0.f, hpMax = 0.f;
@@ -468,9 +483,26 @@ static void Draw(HDC dc, int w, int h) {
                    g_candidates, (int)g_players.size());
         lines.push_back(buf);
 
-        swprintf_s(buf, L"cam %.1f %.1f %.1f",
-                   (double)g_cam.pos.x, (double)g_cam.pos.y, (double)g_cam.pos.z);
+        swprintf_s(buf, L"cam %.1f %.1f %.1f  maxD %.0f  noDist %d",
+                   (double)g_cam.pos.x, (double)g_cam.pos.y, (double)g_cam.pos.z,
+                   (double)g_maxDist, (int)g_noDist);
         lines.push_back(buf);
+
+        swprintf_s(buf, L"dmin %.1f  dmax %.1f", (double)g_dMin, (double)g_dMax);
+        lines.push_back(buf);
+
+        swprintf_s(buf, L"e0 %.1f %.1f %.1f", (double)g_dump[0][0], (double)g_dump[0][1], (double)g_dump[0][2]);
+        lines.push_back(buf);
+        swprintf_s(buf, L"e1 %.1f %.1f %.1f", (double)g_dump[1][0], (double)g_dump[1][1], (double)g_dump[1][2]);
+        lines.push_back(buf);
+        swprintf_s(buf, L"e2 %.1f %.1f %.1f", (double)g_dump[2][0], (double)g_dump[2][1], (double)g_dump[2][2]);
+        lines.push_back(buf);
+
+        swprintf_s(buf, L"rescan 0x%llX spread %d box %.1f",
+                   (unsigned long long)g_foundPos, g_posSpread, (double)g_posBox);
+        lines.push_back(buf);
+
+        g_dMin = 1.0e9f; g_dMax = -1.0e9f;
 
         lines.push_back(g_status.empty() ? L"status OK" : g_status);
 
@@ -492,7 +524,8 @@ static void Draw(HDC dc, int w, int h) {
             lines.push_back(buf);
         }
 
-        lines.push_back(L"F1 esp  F2 debug  F3 hunt  F4 apply  F5 health  F6 find-health");
+        lines.push_back(L"F1 esp  F2 debug  F3 hunt  F4 apply  F5 health F6 find-health F5 noHealth  F7 noDist  F8 rescan pos");
+        
 
         int y = 8;
         for (size_t i = 0; i < lines.size(); ++i) {
@@ -502,6 +535,80 @@ static void Draw(HDC dc, int w, int h) {
     }
 }
 
+// Re-search ONLY the entity-position offset, using the entity list we already
+// trust. Real positions are all distinct from each other and at least one of
+// them sits near the camera; garbage (pointers / rotation data read as floats)
+// is neither.
+static void RescanEntityPosition() {
+    g_foundPos = 0; g_posSpread = 0; g_posBox = 0.f;
+    if (!g_world) return;
+
+    uintptr_t list = Read<uintptr_t>(g_world + g_off.EntityList);
+    int count = Read<int>(g_world + g_off.EntityCount);
+    if (!list || count <= 0) return;
+    if (count > 512) count = 512;
+
+    uintptr_t ents[192];
+    int n = 0;
+    for (int i = 0; i < count && n < 192; ++i) {
+        uintptr_t e = Read<uintptr_t>(list + (uintptr_t)i * sizeof(uintptr_t));
+        if (!e || e < 0x10000) continue;
+        ents[n++] = e;
+    }
+    if (n < 8) return;
+
+    float camMag = sqrtf(g_cam.pos.x * g_cam.pos.x + g_cam.pos.y * g_cam.pos.y + g_cam.pos.z * g_cam.pos.z);
+    float nearLimit = 100.f;
+    if (0.05f * camMag > nearLimit) nearLimit = 0.05f * camMag;
+
+    bool found = false;
+    uintptr_t bestOff = 0;
+    int bestSpread = -1;
+    float bestBox = 0.f;
+
+    for (uintptr_t po = 0; po < 0x400; po += 4) {
+        Vec3 first{}; bool haveFirst = false;
+        float minD = 1.0e30f;
+        float mn[3] = { 1.0e30f, 1.0e30f, 1.0e30f };
+        float mx[3] = { -1.0e30f, -1.0e30f, -1.0e30f };
+        int finite = 0, spread = 0;
+
+        for (int i = 0; i < n; ++i) {
+            Vec3 p = Read<Vec3>(ents[i] + po);
+            if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) continue;
+            if (p.x == 0.f && p.y == 0.f && p.z == 0.f) continue;
+            finite++;
+            if (p.x < mn[0]) mn[0] = p.x;
+            if (p.y < mn[1]) mn[1] = p.y;
+            if (p.z < mn[2]) mn[2] = p.z;
+            if (p.x > mx[0]) mx[0] = p.x;
+            if (p.y > mx[1]) mx[1] = p.y;
+            if (p.z > mx[2]) mx[2] = p.z;
+            float dx = p.x - g_cam.pos.x, dy = p.y - g_cam.pos.y, dz = p.z - g_cam.pos.z;
+            float dd = sqrtf(dx * dx + dy * dy + dz * dz);
+            if (dd < minD) minD = dd;
+            if (!haveFirst) { first = p; haveFirst = true; }
+            else if (fabsf(p.x - first.x) > 0.01f || fabsf(p.y - first.y) > 0.01f ||
+                     fabsf(p.z - first.z) > 0.01f)
+                spread++;
+        }
+
+        if (finite < n / 2) continue;
+        if (minD > nearLimit) continue;
+
+        float bx = mx[0] - mn[0], by = mx[1] - mn[1], bz = mx[2] - mn[2];
+        float box = sqrtf(bx * bx + by * by + bz * bz);
+        if (!(box > 0.5f && box < 1.0e7f)) continue;
+
+        if (spread > bestSpread) { bestSpread = spread; bestOff = po; bestBox = box; found = true; }
+    }
+
+    if (!found) return;
+    g_foundPos  = bestOff;
+    g_posSpread = bestSpread;
+    g_posBox    = bestBox;
+    g_off.EntityPosition = bestOff;
+}
 // ---------------- window ----------------
 static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
     switch (m) {
@@ -576,6 +683,8 @@ static DWORD WINAPI MainThread(LPVOID) {
         if (KeyPressed(VK_F5)) g_needHealth = !g_needHealth;
         if (KeyPressed(VK_F3)) HuntGame();
         if (KeyPressed(VK_F6)) FindHealthOffsets();
+        if (KeyPressed(VK_F7)) g_noDist = !g_noDist;
+        if (KeyPressed(VK_F8)) RescanEntityPosition();
         if (KeyPressed(VK_F4) && !g_gameHits.empty()) {
             static size_t idx = 0;
             const GameHit& hh = g_gameHits[idx % g_gameHits.size()];
