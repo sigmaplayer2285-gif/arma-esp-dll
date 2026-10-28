@@ -1,16 +1,11 @@
-// esp_loader.cpp - stage 2: chain + ESP + debug readout
-#ifndef WIN32_LEAN_AND_MEAN
+// esp_loader.cpp - stage 3: self-searching offsets
 #define WIN32_LEAN_AND_MEAN
-#endif
-#ifndef NOMINMAX
 #define NOMINMAX
-#endif
 #include <windows.h>
 #include <cstdint>
 #include <cstddef>
 #include <cstdio>
 #include <cwchar>
-#include <cstring>
 #include <cmath>
 #include <atomic>
 #include <string>
@@ -41,7 +36,7 @@ struct Camera {
     bool  valid = false;
 };
 
-// ---------------- offsets (same keys as your offsets.ini) ----------------
+// ---------------- offsets ----------------
 struct Offsets {
     uintptr_t Game                  = 0x1D4FCE8;
     uintptr_t GameWorld             = 0x130;
@@ -62,22 +57,25 @@ struct Offsets {
     uintptr_t MaxHealth             = 0x40;
 } g_off;
 
-// ---------------- memory: in-process, plain dereference ----------------
+// ---------------- memory ----------------
 static uintptr_t g_base = 0;
 
-static bool Readable(uintptr_t p, size_t size);   // forward decl
+static inline bool SafeReadRaw(uintptr_t a, void* dst, size_t n) {
+    __try {
+        memcpy(dst, reinterpret_cast<const void*>(a), n);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
 
 template <typename T>
 static inline T Read(uintptr_t a) {
-    if (!Readable(a, sizeof(T))) return T{};
-    return *reinterpret_cast<T*>(a);
+    if (a < 0x10000 || a > 0x7FFFFFFFFFFFull) return T{};
+    T v{};
+    if (!SafeReadRaw(a, &v, sizeof(T))) return T{};
+    return v;
 }
-
-// ---------------- offset hunter ----------------
-static std::vector<uintptr_t> g_gameHits;
-
-static int g_hScan = 0, g_hPtr = 0, g_hWorld = 0, g_hCtrl = 0;
-static int g_hCam = 0, g_hList = 0, g_hNear = 0;
 
 static bool Readable(uintptr_t p, size_t size) {
     if (p < 0x10000 || p > 0x7FFFFFFFFFFFull) return false;
@@ -90,11 +88,75 @@ static bool Readable(uintptr_t p, size_t size) {
     return p + size <= end;
 }
 
-// Walk the known member chain from every 8-byte-aligned value in the module.
-// A hit means the camera landed on sane floats -> that value is the Game ptr.
+// ---------------- hunter ----------------
+struct GameHit {
+    uintptr_t game;
+    uintptr_t listOff;
+    uintptr_t posOff;
+    uintptr_t cntOff;
+};
+
+static std::vector<GameHit> g_gameHits;
+static int g_hScan = 0, g_hPtr = 0, g_hWorld = 0, g_hCtrl = 0, g_hCam = 0, g_hEnt = 0;
+
+// Search the world for an offset that behaves like an entity pointer array
+// whose entries hold positions sitting right next to the camera.
+static bool SearchEntityOffsets(uintptr_t world, const Vec3& cam,
+                                uintptr_t& oList, uintptr_t& oPos, uintptr_t& oCnt) {
+    uintptr_t bestList = 0, bestPos = 0;
+    int bestSane = 0;
+
+    for (uintptr_t lo = 8; lo < 0x400; lo += 8) {
+        uintptr_t list = Read<uintptr_t>(world + lo);
+        if (!Readable(list, 8)) continue;
+
+        for (uintptr_t po = 0; po < 0x200; po += 4) {
+            int sane = 0;
+            float minD = 1.0e18f, sumD = 0.f;
+
+            for (int i = 0; i < 384; ++i) {
+                uintptr_t e = Read<uintptr_t>(list + (uintptr_t)i * sizeof(uintptr_t));
+                if (!Readable(e, 16)) break;
+                Vec3 p = Read<Vec3>(e + po);
+                if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) continue;
+                if (p.x == 0.f && p.y == 0.f && p.z == 0.f) continue;
+                float dx = p.x - cam.x, dy = p.y - cam.y, dz = p.z - cam.z;
+                float dd = sqrtf(dx * dx + dy * dy + dz * dz);
+                if (dd < minD) minD = dd;
+                sumD += dd;
+                sane++;
+            }
+            if (sane < 8) continue;
+
+            if (sane > bestSane) { bestSane = sane; bestList = lo; bestPos = po; }
+
+            float avgD = sumD / (float)sane;
+            if (!(minD < 50.f || minD < 0.05f * avgD)) continue;
+
+            oList = lo; oPos = po; oCnt = 0;
+            for (uintptr_t co = 8; co < 0x400; co += 4) {
+                int c = Read<int>(world + co);
+                if (c >= sane && c <= 100000) { oCnt = co; break; }
+            }
+            return true;
+        }
+    }
+
+    // nothing matched the proximity test - fall back to the densest hit
+    if (bestSane >= 32) {
+        oList = bestList; oPos = bestPos; oCnt = 0;
+        for (uintptr_t co = 8; co < 0x400; co += 4) {
+            int c = Read<int>(world + co);
+            if (c >= bestSane && c <= 100000) { oCnt = co; break; }
+        }
+        return true;
+    }
+    return false;
+}
+
 static void HuntGame() {
     g_gameHits.clear();
-    g_hScan = g_hPtr = g_hWorld = g_hCtrl = g_hCam = g_hList = g_hNear = 0;
+    g_hScan = g_hPtr = g_hWorld = g_hCtrl = g_hCam = g_hEnt = 0;
     if (!g_base) return;
 
     auto dos = reinterpret_cast<PIMAGE_DOS_HEADER>(g_base);
@@ -139,39 +201,17 @@ static void HuntGame() {
             if (mag < 1.f || mag > 1.0e7f) continue;
             g_hCam++;
 
-            uintptr_t list = Read<uintptr_t>(v + g_off.EntityList);
-            int cnt = Read<int>(v + g_off.EntityCount);
-            if (!Readable(list, 8) || cnt < 1 || cnt > 50000) continue;
-            g_hList++;
+            uintptr_t oList = 0, oPos = 0, oCnt = 0;
+            if (!SearchEntityOffsets(w, pos, oList, oPos, oCnt)) continue;
+            g_hEnt++;
 
-            int lim = cnt < 128 ? cnt : 128;
-            int sane = 0;
-            float minD = 1.0e18f, sumD = 0.f;
-            for (int i = 0; i < lim; ++i) {
-                uintptr_t e = Read<uintptr_t>(list + (uintptr_t)i * sizeof(uintptr_t));
-                if (!Readable(e, 12)) continue;
-                Vec3 ep = Read<Vec3>(e + g_off.EntityPosition);
-                if (!std::isfinite(ep.x) || !std::isfinite(ep.y) || !std::isfinite(ep.z)) continue;
-                if (ep.x == 0.f && ep.y == 0.f && ep.z == 0.f) continue;
-                float dx = ep.x - pos.x, dy = ep.y - pos.y, dz = ep.z - pos.z;
-                float dd = sqrtf(dx * dx + dy * dy + dz * dz);
-                if (dd < minD) minD = dd;
-                sumD += dd;
-                sane++;
-            }
-            if (sane < 2) continue;
-
-            float avgD = sumD / (float)sane;
-            if (!(minD < 50.f || minD < 0.1f * avgD)) continue;
-            g_hNear++;
-
-            g_gameHits.push_back(sec[s].VirtualAddress + off);
-            if (g_gameHits.size() >= 24) break;
+            GameHit hit{ sec[s].VirtualAddress + off, oList, oPos, oCnt };
+            g_gameHits.push_back(hit);
+            if (g_gameHits.size() >= 8) break;
         }
-        if (g_gameHits.size() >= 24) break;
+        if (g_gameHits.size() >= 8) break;
     }
 }
-   
 
 // ---------------- globals ----------------
 static HMODULE             g_hSelf    = nullptr;
@@ -363,15 +403,21 @@ static void Draw(HDC dc, int w, int h) {
 
         lines.push_back(g_status.empty() ? L"status OK" : g_status);
 
-        swprintf_s(buf, L"Game off = 0x%llX", (unsigned long long)g_off.Game);
+        swprintf_s(buf, L"Game off 0x%llX  list 0x%llX  pos 0x%llX  cnt 0x%llX",
+                   (unsigned long long)g_off.Game, (unsigned long long)g_off.EntityList,
+                   (unsigned long long)g_off.EntityPosition, (unsigned long long)g_off.EntityCount);
         lines.push_back(buf);
-        swprintf_s(buf, L"hunt: scan %d ptr %d wld %d ctl %d cam %d lst %d nrd %d",
-                   g_hScan, g_hPtr, g_hWorld, g_hCtrl, g_hCam, g_hList, g_hNear);
+
+        swprintf_s(buf, L"hunt scan %d ptr %d wld %d ctl %d cam %d ent %d",
+                   g_hScan, g_hPtr, g_hWorld, g_hCtrl, g_hCam, g_hEnt);
         lines.push_back(buf);
 
         if (!g_gameHits.empty()) {
-            swprintf_s(buf, L"HITS %d  first 0x%llX  (F4 = try next)",
-                       (int)g_gameHits.size(), (unsigned long long)g_gameHits[0]);
+            const GameHit& h = g_gameHits[0];
+            swprintf_s(buf, L"HITS %d  g 0x%llX list 0x%llX pos 0x%llX cnt 0x%llX  (F4)",
+                       (int)g_gameHits.size(), (unsigned long long)h.game,
+                       (unsigned long long)h.listOff, (unsigned long long)h.posOff,
+                       (unsigned long long)h.cntOff);
             lines.push_back(buf);
         }
 
@@ -459,7 +505,11 @@ static DWORD WINAPI MainThread(LPVOID) {
         if (KeyPressed(VK_F3)) HuntGame();
         if (KeyPressed(VK_F4) && !g_gameHits.empty()) {
             static size_t idx = 0;
-            g_off.Game = g_gameHits[idx % g_gameHits.size()];
+            const GameHit& h = g_gameHits[idx % g_gameHits.size()];
+            g_off.Game           = h.game;
+            if (h.listOff) g_off.EntityList     = h.listOff;
+            if (h.posOff)  g_off.EntityPosition = h.posOff;
+            if (h.cntOff)  g_off.EntityCount    = h.cntOff;
             idx++;
         }
 
