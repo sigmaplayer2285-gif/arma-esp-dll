@@ -138,13 +138,13 @@ static void HuntGame() {
 
             int lim = cnt < 256 ? cnt : 256;
             bool nearby = false;
-            for (int i = 0; i < lim && !near; ++i) {
+            for (int i = 0; i < lim && !nearby; ++i) {
                 uintptr_t e = Read<uintptr_t>(list + (uintptr_t)i * sizeof(uintptr_t));
                 if (!Readable(e, 12)) continue;
                 Vec3 ep = Read<Vec3>(e + g_off.EntityPosition);
                 if (!std::isfinite(ep.x) || !std::isfinite(ep.y) || !std::isfinite(ep.z)) continue;
                 float dx = ep.x - pos.x, dy = ep.y - pos.y, dz = ep.z - pos.z;
-                if (dx * dx + dy * dy + dz * dz < 2500.f) near = true;
+                if (dx * dx + dy * dy + dz * dz < 2500.f) nearby = true;
             }
             if (!nearby) continue;
 
