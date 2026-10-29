@@ -1,4 +1,4 @@
-// esp_loader.cpp - stage 8: full chain sweep, correct slot order
+// esp_loader.cpp - stage 9: dots + camera position from local entity
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -18,6 +18,7 @@
 #include <atomic>
 #include <string>
 #include <vector>
+#include <algorithm>
 
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "user32.lib")
@@ -25,7 +26,7 @@
 // ---------------- config ----------------
 static bool  g_espOn     = true;
 static bool  g_showDebug = true;
-static float g_maxDist   = 800.f;
+static float g_maxDist   = 400.f;
 static float g_aimHeight = 1.72f;
 
 // ---------------- offsets ----------------
@@ -65,11 +66,10 @@ struct Camera {
 };
 
 struct Player {
-    float dist  = 0.f;
-    float hp    = 0.f;
+    float dist = 0.f;
+    float hp = 0.f;
     float hpMax = 0.f;
     Vec2  head{};
-    Vec2  foot{};
     bool  onScreen = false;
 };
 
@@ -109,6 +109,13 @@ static bool Finite(const Vec3& v) {
     return std::isfinite(v.x) && std::isfinite(v.y) && std::isfinite(v.z);
 }
 
+static bool SolidPos(const Vec3& p) {
+    if (!Finite(p)) return false;
+    if (p.x == 0.f && p.y == 0.f && p.z == 0.f) return false;
+    if (fabsf(p.x) > 1.0e7f || fabsf(p.y) > 1.0e7f || fabsf(p.z) > 1.0e7f) return false;
+    return true;
+}
+
 // ---------------- state ----------------
 static HWND    g_hwnd  = nullptr;
 static HDC     g_dc    = nullptr;
@@ -120,15 +127,15 @@ static std::atomic<bool> g_running{ false };
 
 static uintptr_t g_game = 0, g_world = 0, g_local = 0;
 static uintptr_t g_lpc = 0, g_weak = 0, g_delta = 0, g_pc = 0;
+static uintptr_t g_localEnt = 0;
 
 static Camera    g_cam;
 static std::vector<Player> g_players;
 static int       g_entCount = 0, g_saneEnts = 0, g_candidates = 0;
 static int       g_distOk = 0, g_h1Ok = 0, g_h2Ok = 0, g_hpOk = 0;
 static std::wstring g_status;
-static bool      g_needHealth = true;
+static bool      g_needHealth = false;
 
-// stage 5 diagnostics
 static bool      g_noDist     = false;
 static float     g_dMin       = 1.0e9f;
 static float     g_dMax       = -1.0e9f;
@@ -178,9 +185,7 @@ static bool SearchEntityOffsets(uintptr_t world, const Vec3& cam,
                 uintptr_t e = Read<uintptr_t>(list + (uintptr_t)i * sizeof(uintptr_t));
                 if (!Readable(e, 16)) break;
                 Vec3 p = Read<Vec3>(e + po);
-                if (!Finite(p)) continue;
-                if (p.x == 0.f && p.y == 0.f && p.z == 0.f) continue;
-                if (fabsf(p.x) > 1.0e7f || fabsf(p.y) > 1.0e7f || fabsf(p.z) > 1.0e7f) continue;
+                if (!SolidPos(p)) continue;
                 float dx = p.x - cam.x, dy = p.y - cam.y, dz = p.z - cam.z;
                 float dd = sqrtf(dx * dx + dy * dy + dz * dz);
                 if (dd < minD) minD = dd;
@@ -210,60 +215,6 @@ static bool SearchEntityOffsets(uintptr_t world, const Vec3& cam,
         return true;
     }
     return false;
-}
-
-static bool HealthPairOk(uintptr_t ent, uintptr_t c1, uintptr_t c2, float& hp, float& mx) {
-    uintptr_t h1 = Read<uintptr_t>(ent + c1);
-    if (!h1) return false;
-    uintptr_t h2 = Read<uintptr_t>(h1 + c2);
-    if (!h2) return false;
-    hp = Read<float>(h2 + g_off.Health);
-    mx = Read<float>(h2 + g_off.MaxHealth);
-    if (!(mx > 0.1f && mx < 1.0e6f)) return false;
-    if (!(hp > 0.f && hp <= mx * 1.05f)) return false;
-    return true;
-}
-
-static void FindHealthOffsets() {
-    if (!g_world) return;
-
-    uintptr_t list = Read<uintptr_t>(g_world + g_off.EntityList);
-    int count = Read<int>(g_world + g_off.EntityCount);
-    if (!list || count <= 0) return;
-    if (count > 4096) count = 4096;
-
-    std::vector<uintptr_t> sample;
-    for (int i = 0; i < count && sample.size() < 64; ++i) {
-        uintptr_t e = Read<uintptr_t>(list + (uintptr_t)i * sizeof(uintptr_t));
-        if (!e || e < 0x10000) continue;
-        Vec3 p = Read<Vec3>(e + g_off.EntityPosition);
-        if (!Finite(p)) continue;
-        float dx = p.x - g_cam.pos.x, dy = p.y - g_cam.pos.y, dz = p.z - g_cam.pos.z;
-        if (sqrtf(dx * dx + dy * dy + dz * dz) > g_maxDist) continue;
-        sample.push_back(e);
-    }
-    if (sample.size() < 4) return;
-
-    for (uintptr_t c1 = 0; c1 < 0x300; c1 += 8) {
-        for (uintptr_t c2 = 0; c2 < 0x200; c2 += 8) {
-            int good = 0, sameMax = 0;
-            float firstMax = 0.f;
-
-            for (size_t i = 0; i < sample.size(); ++i) {
-                float hp = 0.f, mx = 0.f;
-                if (!HealthPairOk(sample[i], c1, c2, hp, mx)) continue;
-                good++;
-                if (firstMax == 0.f) firstMax = mx;
-                else if (fabsf(mx - firstMax) < 0.01f * firstMax) sameMax++;
-            }
-            if (good >= 4 && sameMax >= 3) {
-                g_off.HealthChain1 = c1;
-                g_off.HealthChain2 = c2;
-                g_needHealth = true;
-                return;
-            }
-        }
-    }
 }
 
 static void HuntGame() {
@@ -309,8 +260,7 @@ static void HuntGame() {
             g_hCtrl++;
 
             Vec3 pos = Read<Vec3>(pc + g_off.CameraPosition);
-            if (!Finite(pos)) continue;
-            if (pos.x == 0.f && pos.y == 0.f && pos.z == 0.f) continue;
+            if (!SolidPos(pos)) continue;
             float mag = sqrtf(pos.x * pos.x + pos.y * pos.y + pos.z * pos.z);
             if (mag < 1.f || mag > 1.0e7f) continue;
             g_hCam++;
@@ -387,7 +337,18 @@ static void Update() {
     g_cam.right = Read<Vec3>(pc + g_off.InvertedViewRight);
     g_cam.up    = Read<Vec3>(pc + g_off.InvertedViewUp);
     g_cam.fwd   = Read<Vec3>(pc + g_off.VectorViewForward);
-    if (!Finite(g_cam.pos) || !Finite(g_cam.fwd)) { g_status = L"camera garbage"; return; }
+    if (!Finite(g_cam.right) || !Finite(g_cam.fwd)) { g_status = L"camera garbage"; return; }
+
+    // The camera position is not stored in this object. Fall back to the local
+    // entity's own position, which is the same place to within a metre.
+    if (!SolidPos(g_cam.pos) && g_localEnt) {
+        Vec3 lp = Read<Vec3>(g_localEnt + g_off.EntityPosition);
+        if (SolidPos(lp)) {
+            g_cam.pos = lp;
+            g_cam.pos.z += g_aimHeight;
+        }
+    }
+    if (!SolidPos(g_cam.pos)) { g_status = L"no camera position"; return; }
     g_cam.valid = true;
 
     uintptr_t list = Read<uintptr_t>(world + g_off.EntityList);
@@ -401,8 +362,7 @@ static void Update() {
         if (!ent || ent < 0x10000) continue;
 
         Vec3 pos = Read<Vec3>(ent + g_off.EntityPosition);
-        if (!Finite(pos) || (pos.x == 0.f && pos.y == 0.f && pos.z == 0.f)) continue;
-        if (fabsf(pos.x) > 1.0e7f || fabsf(pos.y) > 1.0e7f || fabsf(pos.z) > 1.0e7f) continue;
+        if (!SolidPos(pos)) continue;
         g_saneEnts++;
 
         Vec3 d{ pos.x - g_cam.pos.x, pos.y - g_cam.pos.y, pos.z - g_cam.pos.z };
@@ -415,7 +375,7 @@ static void Update() {
             g_dump[k][1] = pos.y;
             g_dump[k][2] = pos.z;
         }
-        if (!g_noDist && (dist > g_maxDist || dist < 0.05f)) continue;
+        if (!g_noDist && (dist > g_maxDist || dist < 0.5f)) continue;
         g_distOk++;
 
         float hp = 0.f, hpMax = 0.f;
@@ -440,8 +400,40 @@ static void Update() {
         p.hpMax = hpMax;
         Vec3 head{ pos.x, pos.y, pos.z + g_aimHeight };
         p.onScreen = WorldToScreen(head, p.head);
-        if (p.onScreen) WorldToScreen(pos, p.foot);
         g_players.push_back(p);
+    }
+
+    std::sort(g_players.begin(), g_players.end(),
+              [](const Player& a, const Player& b) { return a.dist < b.dist; });
+    if (g_players.size() > 200) g_players.resize(200);
+}
+
+// ---------------- local entity ----------------
+static void FindLocalEntity() {
+    g_localEnt = 0;
+    if (!g_pc || !g_world) return;
+
+    uintptr_t list = Read<uintptr_t>(g_world + g_off.EntityList);
+    int count = Read<int>(g_world + g_off.EntityCount);
+    if (!list || count <= 0) return;
+    if (count > 4096) count = 4096;
+
+    std::vector<uintptr_t> ents;
+    ents.reserve((size_t)count);
+    for (int i = 0; i < count; ++i) {
+        uintptr_t e = Read<uintptr_t>(list + (uintptr_t)i * sizeof(uintptr_t));
+        if (!e || e < 0x10000) continue;
+        ents.push_back(e);
+    }
+    if (ents.empty()) return;
+
+    // The controller holds a reference to the local player's own entity.
+    for (uintptr_t o = 0; o < 0x1000; o += 8) {
+        uintptr_t v = Read<uintptr_t>(g_pc + o);
+        if (!v || v < 0x10000) continue;
+        for (size_t i = 0; i < ents.size(); ++i) {
+            if (ents[i] == v) { g_localEnt = v; return; }
+        }
     }
 }
 
@@ -466,73 +458,53 @@ static void RescanEntityPosition() {
     }
     if (n < 8) return;
 
-    float camMag = sqrtf(g_cam.pos.x * g_cam.pos.x + g_cam.pos.y * g_cam.pos.y +
-                         g_cam.pos.z * g_cam.pos.z);
-    float nearLimit = 100.f;
-    if (0.05f * camMag > nearLimit) nearLimit = 0.05f * camMag;
+    uintptr_t bestOff = 0;
+    int bestSpread = -1;
+    float bestBox = 0.f;
 
-    for (int pass = 0; pass < 2; ++pass) {
-        const bool useNear = (pass == 0);
-        bool found = false;
-        uintptr_t bestOff = 0;
-        int bestSpread = -1;
-        float bestBox = 0.f;
+    for (uintptr_t po = 0; po < 0x400; po += 4) {
+        Vec3 first{};
+        bool haveFirst = false;
+        float mn[3] = { 1.0e30f, 1.0e30f, 1.0e30f };
+        float mx[3] = { -1.0e30f, -1.0e30f, -1.0e30f };
+        int finite = 0, spread = 0;
 
-        for (uintptr_t po = 0; po < 0x400; po += 4) {
-            Vec3 first{};
-            bool haveFirst = false;
-            float minD = 1.0e30f;
-            float mn[3] = { 1.0e30f, 1.0e30f, 1.0e30f };
-            float mx[3] = { -1.0e30f, -1.0e30f, -1.0e30f };
-            int finite = 0, spread = 0;
+        for (int i = 0; i < n; ++i) {
+            Vec3 p = Read<Vec3>(ents[i] + po);
+            if (!SolidPos(p)) continue;
+            finite++;
 
-            for (int i = 0; i < n; ++i) {
-                Vec3 p = Read<Vec3>(ents[i] + po);
-                if (!Finite(p)) continue;
-                if (p.x == 0.f && p.y == 0.f && p.z == 0.f) continue;
-                if (fabsf(p.x) > 1.0e7f || fabsf(p.y) > 1.0e7f || fabsf(p.z) > 1.0e7f) continue;
-                finite++;
+            if (p.x < mn[0]) mn[0] = p.x;
+            if (p.y < mn[1]) mn[1] = p.y;
+            if (p.z < mn[2]) mn[2] = p.z;
+            if (p.x > mx[0]) mx[0] = p.x;
+            if (p.y > mx[1]) mx[1] = p.y;
+            if (p.z > mx[2]) mx[2] = p.z;
 
-                if (p.x < mn[0]) mn[0] = p.x;
-                if (p.y < mn[1]) mn[1] = p.y;
-                if (p.z < mn[2]) mn[2] = p.z;
-                if (p.x > mx[0]) mx[0] = p.x;
-                if (p.y > mx[1]) mx[1] = p.y;
-                if (p.z > mx[2]) mx[2] = p.z;
-
-                float dx = p.x - g_cam.pos.x, dy = p.y - g_cam.pos.y, dz = p.z - g_cam.pos.z;
-                float dd = sqrtf(dx * dx + dy * dy + dz * dz);
-                if (dd < minD) minD = dd;
-
-                if (!haveFirst) { first = p; haveFirst = true; }
-                else if (fabsf(p.x - first.x) > 0.01f || fabsf(p.y - first.y) > 0.01f ||
-                         fabsf(p.z - first.z) > 0.01f)
-                    spread++;
-            }
-
-            if (finite < n / 2) continue;
-            if (useNear && minD > nearLimit) continue;
-            if (!useNear && spread < n / 2) continue;
-
-            float bx = mx[0] - mn[0], by = mx[1] - mn[1], bz = mx[2] - mn[2];
-            float box = sqrtf(bx * bx + by * by + bz * bz);
-            if (!(box > 0.5f && box < 1.0e7f)) continue;
-
-            if (spread > bestSpread) {
-                bestSpread = spread;
-                bestOff = po;
-                bestBox = box;
-                found = true;
-            }
+            if (!haveFirst) { first = p; haveFirst = true; }
+            else if (fabsf(p.x - first.x) > 0.01f || fabsf(p.y - first.y) > 0.01f ||
+                     fabsf(p.z - first.z) > 0.01f)
+                spread++;
         }
 
-        if (!found) continue;
-        g_foundPos = bestOff;
-        g_posSpread = bestSpread;
-        g_posBox = bestBox;
-        g_off.EntityPosition = bestOff;
-        return;
+        if (finite < n / 2) continue;
+
+        float bx = mx[0] - mn[0], by = mx[1] - mn[1], bz = mx[2] - mn[2];
+        float box = sqrtf(bx * bx + by * by + bz * bz);
+        if (!(box > 20.f && box < 1.0e7f)) continue;
+
+        if (spread > bestSpread) {
+            bestSpread = spread;
+            bestOff = po;
+            bestBox = box;
+        }
     }
+
+    if (bestSpread < 0) return;
+    g_foundPos = bestOff;
+    g_posSpread = bestSpread;
+    g_posBox = bestBox;
+    g_off.EntityPosition = bestOff;
 }
 
 // ---------------- camera recovery ----------------
@@ -545,8 +517,6 @@ static float Dot3(const Vec3& a, const Vec3& b) {
     return a.x * b.x + a.y * b.y + a.z * b.z;
 }
 
-// A view matrix is an orthonormal basis plus a translation. The basis
-// validates itself, so no guessed offset is needed.
 static void ScanBasis(uintptr_t obj) {
     if (!obj || obj < 0x10000) return;
 
@@ -569,8 +539,7 @@ static void ScanBasis(uintptr_t obj) {
 
             for (int k = 0; k < np; ++k) {
                 Vec3 p = Read<Vec3>(obj + posOffs[k]);
-                if (!Finite(p)) continue;
-                if (p.x == 0.f && p.y == 0.f && p.z == 0.f) continue;
+                if (!SolidPos(p)) continue;
 
                 int solid = 0;
                 if (fabsf(p.x) >= 1.f) solid++;
@@ -593,6 +562,9 @@ static void FixCamera() {
     g_camCands.clear();
     g_camRight = 0;
 
+    FindLocalEntity();
+    RescanEntityPosition();
+
     uintptr_t roots[6] = { g_pc, g_delta, g_weak, g_lpc, g_world, g_game };
     for (int i = 0; i < 6; ++i) {
         if (!roots[i]) continue;
@@ -608,8 +580,6 @@ static void FixCamera() {
     }
     if (g_camCands.empty()) return;
 
-    // Real world coordinates sit far from the origin; object-space transforms
-    // sit near it. Prefer the largest magnitude.
     const CamCand* best = &g_camCands[0];
     for (size_t i = 1; i < g_camCands.size(); ++i)
         if (g_camCands[i].mag > best->mag) best = &g_camCands[i];
@@ -620,13 +590,18 @@ static void FixCamera() {
     g_off.VectorViewForward = best->basis + best->stride * 2;
     g_camRight = best->basis;
 
-    g_cam.pos   = Read<Vec3>(best->obj + best->posOff);
     g_cam.right = Read<Vec3>(best->obj + best->basis);
     g_cam.up    = Read<Vec3>(best->obj + best->basis + best->stride);
     g_cam.fwd   = Read<Vec3>(best->obj + best->basis + best->stride * 2);
-    g_cam.valid = true;
 
-    RescanEntityPosition();
+    if (g_localEnt) {
+        Vec3 lp = Read<Vec3>(g_localEnt + g_off.EntityPosition);
+        if (SolidPos(lp)) {
+            g_cam.pos = lp;
+            g_cam.pos.z += g_aimHeight;
+        }
+    }
+    g_cam.valid = true;
 }
 
 // ---------------- drawing ----------------
@@ -665,31 +640,15 @@ static void Draw() {
         for (size_t i = 0; i < g_players.size(); ++i) {
             const Player& p = g_players[i];
             if (!p.onScreen) continue;
+            if (p.head.x < -40.f || p.head.x > g_w + 40.f) continue;
+            if (p.head.y < -40.f || p.head.y > g_h + 40.f) continue;
 
-            float hgt = p.foot.y - p.head.y;
-            if (hgt < 2.f || hgt > 4000.f) continue;
-            float wid = hgt * 0.45f;
-            if (wid < 1.f) wid = 1.f;
-            float bx = p.head.x - wid * 0.5f;
-            float by = p.head.y;
+            Fill(g_dc, p.head.x - 4.f, p.head.y - 4.f, 9.f, 9.f, RGB(1, 1, 1));
+            Fill(g_dc, p.head.x - 3.f, p.head.y - 3.f, 7.f, 7.f, RGB(0, 255, 120));
 
-            Fill(g_dc, bx - 1.f, by - 1.f, wid + 2.f, hgt + 2.f, RGB(1, 1, 1));
-            Fill(g_dc, bx, by, wid, 1.f, RGB(0, 255, 120));
-            Fill(g_dc, bx, by + hgt, wid, 1.f, RGB(0, 255, 120));
-            Fill(g_dc, bx, by, 1.f, hgt, RGB(0, 255, 120));
-            Fill(g_dc, bx + wid, by, 1.f, hgt, RGB(0, 255, 120));
-
-            if (g_needHealth && p.hpMax > 0.1f) {
-                float frac = p.hp / p.hpMax;
-                if (frac < 0.f) frac = 0.f;
-                if (frac > 1.f) frac = 1.f;
-                Fill(g_dc, bx - 6.f, by, 3.f, hgt, RGB(45, 45, 45));
-                Fill(g_dc, bx - 6.f, by + hgt * (1.f - frac), 3.f, hgt * frac, RGB(0, 255, 130));
-            }
-
-            wchar_t nbuf[32];
-            swprintf_s(nbuf, L"%dm", (int)p.dist);
-            Text(g_dc, (int)(bx + wid * 0.5f) - 14, (int)(by + hgt + 2), nbuf, RGB(205, 205, 205));
+            wchar_t nb[16];
+            swprintf_s(nb, L"%d", (int)p.dist);
+            Text(g_dc, (int)p.head.x + 7, (int)p.head.y - 6, nb, RGB(160, 255, 160));
         }
     }
 
@@ -699,14 +658,8 @@ static void Draw() {
 
         lines.push_back(L"ESP LOADED");
 
-        swprintf_s(buf, L"base  %llX", (unsigned long long)g_base);   lines.push_back(buf);
-        swprintf_s(buf, L"game  %llX", (unsigned long long)g_game);   lines.push_back(buf);
-        swprintf_s(buf, L"world %llX", (unsigned long long)g_world);  lines.push_back(buf);
-        swprintf_s(buf, L"local %llX", (unsigned long long)g_local);  lines.push_back(buf);
-
-        swprintf_s(buf, L"ents %d | sane %d | dist %d | h1 %d | h2 %d | hp %d | cand %d | players %d",
-                   g_entCount, g_saneEnts, g_distOk, g_h1Ok, g_h2Ok, g_hpOk,
-                   g_candidates, (int)g_players.size());
+        swprintf_s(buf, L"ents %d | sane %d | dist %d | dots %d",
+                   g_entCount, g_saneEnts, g_distOk, (int)g_players.size());
         lines.push_back(buf);
 
         swprintf_s(buf, L"cam %.1f %.1f %.1f  maxD %.0f  noDist %d",
@@ -720,25 +673,17 @@ static void Draw() {
         swprintf_s(buf, L"e0 %.1f %.1f %.1f",
                    (double)g_dump[0][0], (double)g_dump[0][1], (double)g_dump[0][2]);
         lines.push_back(buf);
-        swprintf_s(buf, L"e1 %.1f %.1f %.1f",
-                   (double)g_dump[1][0], (double)g_dump[1][1], (double)g_dump[1][2]);
-        lines.push_back(buf);
-        swprintf_s(buf, L"e2 %.1f %.1f %.1f",
-                   (double)g_dump[2][0], (double)g_dump[2][1], (double)g_dump[2][2]);
-        lines.push_back(buf);
 
         {
             wchar_t t1[160];
-            wchar_t t2[160];
-            wchar_t t3[96];
+            wchar_t t2[128];
             swprintf_s(t1, L"rescan 0x%llX spread %d box %.1f",
                        (unsigned long long)g_foundPos, (int)g_posSpread, (double)g_posBox);
-            swprintf_s(t2, L"camOff 0x%llX right 0x%llX",
-                       (unsigned long long)g_off.CameraPosition, (unsigned long long)g_camRight);
-            swprintf_s(t3, L"camCands %d", (int)g_camCands.size());
+            swprintf_s(t2, L"camOff 0x%llX cands %d  localEnt %llX",
+                       (unsigned long long)g_off.CameraPosition, (int)g_camCands.size(),
+                       (unsigned long long)g_localEnt);
             lines.push_back(t1);
             lines.push_back(t2);
-            lines.push_back(t3);
         }
 
         lines.push_back(g_status.empty() ? L"status OK" : g_status);
@@ -748,26 +693,20 @@ static void Draw() {
                    (unsigned long long)g_off.EntityPosition, (unsigned long long)g_off.EntityCount);
         lines.push_back(buf);
 
-        swprintf_s(buf, L"hc1 0x%llX hc2 0x%llX hp 0x%llX needHealth %d",
-                   (unsigned long long)g_off.HealthChain1, (unsigned long long)g_off.HealthChain2,
-                   (unsigned long long)g_off.Health, (int)g_needHealth);
-        lines.push_back(buf);
-
         swprintf_s(buf, L"hunt scan %d ptr %d wld %d ctl %d cam %d ent %d",
                    g_hScan, g_hPtr, g_hWorld, g_hCtrl, g_hCam, g_hEnt);
         lines.push_back(buf);
 
         if (!g_gameHits.empty()) {
             const GameHit& hit = g_gameHits[0];
-            swprintf_s(buf, L"HITS %d  g 0x%llX list 0x%llX pos 0x%llX cnt 0x%llX  (F4)",
+            swprintf_s(buf, L"HITS %d  g 0x%llX list 0x%llX pos 0x%llX  (F4)",
                        (int)g_gameHits.size(), (unsigned long long)hit.game,
-                       (unsigned long long)hit.listOff, (unsigned long long)hit.posOff,
-                       (unsigned long long)hit.cntOff);
+                       (unsigned long long)hit.listOff, (unsigned long long)hit.posOff);
             lines.push_back(buf);
         }
 
-        lines.push_back(L"F1 esp  F2 debug  F3 hunt  F4 apply");
-        lines.push_back(L"F5 noHealth  F7 noDist  F8 rescan pos  F9 fix cam");
+        lines.push_back(L"F1 dots  F2 debug  F3 hunt  F4 apply");
+        lines.push_back(L"F7 noDist  F8 find pos  F9 fix cam");
 
         int y = 8;
         for (size_t i = 0; i < lines.size(); ++i) {
@@ -857,8 +796,6 @@ static DWORD WINAPI MainThread(LPVOID) {
             if (hit.cntOff)  g_off.EntityCount = hit.cntOff;
             idx++;
         }
-        if (KeyPressed(VK_F5)) g_needHealth = !g_needHealth;
-        if (KeyPressed(VK_F6)) FindHealthOffsets();
         if (KeyPressed(VK_F7)) g_noDist = !g_noDist;
         if (KeyPressed(VK_F8)) RescanEntityPosition();
         if (KeyPressed(VK_F9)) FixCamera();
