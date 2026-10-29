@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cmath>
+#include <cwchar>
 #include <atomic>
 #include <string>
 #include <vector>
@@ -54,6 +55,22 @@ struct Offsets {
 // ---------------- math ----------------
 struct Vec2 { float x = 0.f, y = 0.f; };
 struct Vec3 { float x = 0.f, y = 0.f, z = 0.f; };
+struct Camera {
+    Vec3 pos{};
+    Vec3 right{};
+    Vec3 up{};
+    Vec3 fwd{};
+    bool valid = false;
+};
+
+struct Player {
+    float dist  = 0.f;
+    float hp    = 0.f;
+    float hpMax = 0.f;
+    Vec2  head{};
+    Vec2  foot{};
+    bool  onScreen = false;
+};
 
 // ---------------- memory ----------------
 static uintptr_t g_base = 0;
@@ -738,7 +755,7 @@ static DWORD WINAPI MainThread(LPVOID) {
     wc.cbSize = sizeof(wc);
     wc.lpfnWndProc = WndProc;
     wc.hInstance = g_hSelf;
-    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    wc.hCursor = LoadCursorW(nullptr, (LPCWSTR)IDC_ARROW);
     wc.lpszClassName = L"ReforgerEsp";
     RegisterClassExW(&wc);
 
