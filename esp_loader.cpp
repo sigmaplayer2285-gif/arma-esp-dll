@@ -1,4 +1,4 @@
-// esp_loader.cpp - stage 6: camera recovery + entity position rescan
+// esp_loader.cpp - stage 7: chain-wide camera sweep
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -55,6 +55,7 @@ struct Offsets {
 // ---------------- math ----------------
 struct Vec2 { float x = 0.f, y = 0.f; };
 struct Vec3 { float x = 0.f, y = 0.f, z = 0.f; };
+
 struct Camera {
     Vec3 pos{};
     Vec3 right{};
@@ -109,15 +110,17 @@ static bool Finite(const Vec3& v) {
 }
 
 // ---------------- state ----------------
-static HWND    g_hwnd = nullptr;
-static HDC     g_dc   = nullptr;
-static HFONT   g_font = nullptr;
-static int     g_w    = 0;
-static int     g_h    = 0;
+static HWND    g_hwnd  = nullptr;
+static HDC     g_dc    = nullptr;
+static HFONT   g_font  = nullptr;
+static int     g_w     = 0;
+static int     g_h     = 0;
 static HMODULE g_hSelf = nullptr;
 static std::atomic<bool> g_running{ false };
 
 static uintptr_t g_game = 0, g_world = 0, g_local = 0;
+static uintptr_t g_lpc = 0, g_weak = 0, g_delta = 0, g_pc = 0;
+
 static Camera    g_cam;
 static std::vector<Player> g_players;
 static int       g_entCount = 0, g_saneEnts = 0, g_candidates = 0;
@@ -134,6 +137,15 @@ static uintptr_t g_foundPos   = 0;
 static int       g_posSpread  = 0;
 static float     g_posBox     = 0.f;
 static uintptr_t g_camRight   = 0;
+
+struct CamCand {
+    uintptr_t obj;
+    uintptr_t basis;
+    uintptr_t stride;
+    uintptr_t posOff;
+    float     mag;
+};
+static std::vector<CamCand> g_camCands;
 
 static void RescanEntityPosition();
 static void FixCamera();
@@ -342,6 +354,7 @@ static void Update() {
     g_status.clear();
     g_cam.valid = false;
     g_game = g_world = g_local = 0;
+    g_lpc = g_weak = g_delta = g_pc = 0;
 
     if (!g_base) { g_status = L"base null"; return; }
 
@@ -355,13 +368,20 @@ static void Update() {
 
     uintptr_t lpc = Read<uintptr_t>(game + g_off.LocalPlayerController);
     if (!lpc) { g_status = L"controller null"; return; }
+    g_lpc = lpc;
+
     uintptr_t weak = Read<uintptr_t>(lpc + g_off.WeakPtr);
     if (!weak) { g_status = L"weak null"; return; }
+    g_weak = weak;
+
     uintptr_t delta = Read<uintptr_t>(weak + g_off.LocalPlayerDelta);
     if (!delta) { g_status = L"delta null"; return; }
+    g_delta = delta;
+
     uintptr_t pc = Read<uintptr_t>(delta + g_off.LocalPlayerCamera);
     if (!pc) { g_status = L"camera null"; return; }
     g_local = pc;
+    g_pc = pc;
 
     g_cam.pos   = Read<Vec3>(pc + g_off.CameraPosition);
     g_cam.right = Read<Vec3>(pc + g_off.InvertedViewRight);
@@ -525,43 +545,79 @@ static float Dot3(const Vec3& a, const Vec3& b) {
     return a.x * b.x + a.y * b.y + a.z * b.z;
 }
 
-// The view basis is unit-length and mutually perpendicular, so it validates
-// itself. The camera position sits 0x18 before the right vector.
-static bool FindCameraBasis(uintptr_t obj) {
-    for (uintptr_t o = 0x18; o < 0x600; o += 4) {
-        Vec3 r = Read<Vec3>(obj + o);
-        Vec3 u = Read<Vec3>(obj + o + 0x0C);
-        Vec3 f = Read<Vec3>(obj + o + 0x18);
-        if (!UnitVec(r) || !UnitVec(u) || !UnitVec(f)) continue;
-        if (fabsf(Dot3(r, u)) > 0.15f || fabsf(Dot3(r, f)) > 0.15f ||
-            fabsf(Dot3(u, f)) > 0.15f) continue;
+// A view matrix is an orthonormal basis plus a translation. The basis
+// validates itself, so no guessed offset is needed.
+static void ScanBasis(uintptr_t obj) {
+    if (!obj || obj < 0x10000) return;
 
-        Vec3 p = Read<Vec3>(obj + o - 0x18);
-        if (!Finite(p)) continue;
-        if (p.x == 0.f && p.y == 0.f && p.z == 0.f) continue;
-        if (fabsf(p.x) > 1.0e6f || fabsf(p.y) > 1.0e6f || fabsf(p.z) > 1.0e6f) continue;
+    for (uintptr_t o = 0; o < 0x800; o += 4) {
+        for (int s = 0; s < 2; ++s) {
+            const uintptr_t stride = s ? 0x10 : 0x0C;
 
-        g_off.CameraPosition    = o - 0x18;
-        g_off.InvertedViewRight = o;
-        g_off.InvertedViewUp    = o + 0x0C;
-        g_off.VectorViewForward = o + 0x18;
-        g_camRight = o;
-        return true;
+            Vec3 r = Read<Vec3>(obj + o);
+            Vec3 u = Read<Vec3>(obj + o + stride);
+            Vec3 f = Read<Vec3>(obj + o + stride * 2);
+            if (!UnitVec(r) || !UnitVec(u) || !UnitVec(f)) continue;
+            if (fabsf(Dot3(r, u)) > 0.15f || fabsf(Dot3(r, f)) > 0.15f ||
+                fabsf(Dot3(u, f)) > 0.15f) continue;
+
+            uintptr_t posOffs[3];
+            int np = 0;
+            posOffs[np++] = o + stride * 3;
+            posOffs[np++] = o + stride * 3 + 0x10;
+            if (o >= 0x18) posOffs[np++] = o - 0x18;
+
+            for (int k = 0; k < np; ++k) {
+                Vec3 p = Read<Vec3>(obj + posOffs[k]);
+                if (!Finite(p)) continue;
+                if (p.x == 0.f && p.y == 0.f && p.z == 0.f) continue;
+                float m = sqrtf(p.x * p.x + p.y * p.y + p.z * p.z);
+                if (m < 1.f || m > 1.0e6f) continue;
+
+                g_camCands.push_back(CamCand{ obj, o, stride, posOffs[k], m });
+                break;
+            }
+            if (g_camCands.size() > 96) return;
+        }
     }
-    return false;
 }
 
 static void FixCamera() {
+    g_camCands.clear();
     g_camRight = 0;
-    uintptr_t pc = g_local;
-    if (!pc) return;
-    if (FindCameraBasis(pc)) { RescanEntityPosition(); return; }
 
-    for (uintptr_t o = 0; o < 0x600; o += 8) {
-        uintptr_t sub = Read<uintptr_t>(pc + o);
-        if (!sub || sub < 0x10000) continue;
-        if (FindCameraBasis(sub)) { RescanEntityPosition(); return; }
+    uintptr_t roots[6] = { g_pc, g_delta, g_weak, g_lpc, g_world, g_game };
+    for (int i = 0; i < 6 && g_camCands.size() <= 96; ++i) {
+        if (!roots[i]) continue;
+        ScanBasis(roots[i]);
+        for (uintptr_t o = 0; o < 0x800 && g_camCands.size() <= 96; o += 8) {
+            uintptr_t sub = Read<uintptr_t>(roots[i] + o);
+            if (!sub || sub < 0x10000) continue;
+            if (!Readable(sub, 0x100)) continue;
+            ScanBasis(sub);
+        }
     }
+    if (g_camCands.empty()) return;
+
+    // Real world coordinates sit far from the origin; object-space transforms
+    // sit near it. Prefer the largest magnitude.
+    const CamCand* best = &g_camCands[0];
+    for (size_t i = 1; i < g_camCands.size(); ++i)
+        if (g_camCands[i].mag > best->mag) best = &g_camCands[i];
+
+    g_off.CameraPosition    = best->posOff;
+    g_off.InvertedViewRight = best->basis;
+    g_off.InvertedViewUp    = best->basis + best->stride;
+    g_off.VectorViewForward = best->basis + best->stride * 2;
+    g_camRight = best->basis;
+
+    g_cam.pos   = Read<Vec3>(best->obj + best->posOff);
+    g_cam.right = Read<Vec3>(best->obj + best->basis);
+    g_cam.up    = Read<Vec3>(best->obj + best->basis + best->stride);
+    g_cam.fwd   = Read<Vec3>(best->obj + best->basis + best->stride * 2);
+    g_cam.valid = true;
+
+    RescanEntityPosition();
 }
 
 // ---------------- drawing ----------------
@@ -665,12 +721,15 @@ static void Draw() {
         {
             wchar_t t1[160];
             wchar_t t2[160];
+            wchar_t t3[96];
             swprintf_s(t1, L"rescan 0x%llX spread %d box %.1f",
                        (unsigned long long)g_foundPos, (int)g_posSpread, (double)g_posBox);
             swprintf_s(t2, L"camOff 0x%llX right 0x%llX",
                        (unsigned long long)g_off.CameraPosition, (unsigned long long)g_camRight);
+            swprintf_s(t3, L"camCands %d", (int)g_camCands.size());
             lines.push_back(t1);
             lines.push_back(t2);
+            lines.push_back(t3);
         }
 
         lines.push_back(g_status.empty() ? L"status OK" : g_status);
