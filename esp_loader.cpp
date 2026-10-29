@@ -1,4 +1,4 @@
-// esp_loader.cpp - stage 7: chain-wide camera sweep
+// esp_loader.cpp - stage 8: full chain sweep, correct slot order
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -563,21 +563,28 @@ static void ScanBasis(uintptr_t obj) {
 
             uintptr_t posOffs[3];
             int np = 0;
+            if (o >= 0x18) posOffs[np++] = o - 0x18;
             posOffs[np++] = o + stride * 3;
             posOffs[np++] = o + stride * 3 + 0x10;
-            if (o >= 0x18) posOffs[np++] = o - 0x18;
 
             for (int k = 0; k < np; ++k) {
                 Vec3 p = Read<Vec3>(obj + posOffs[k]);
                 if (!Finite(p)) continue;
                 if (p.x == 0.f && p.y == 0.f && p.z == 0.f) continue;
+
+                int solid = 0;
+                if (fabsf(p.x) >= 1.f) solid++;
+                if (fabsf(p.y) >= 1.f) solid++;
+                if (fabsf(p.z) >= 1.f) solid++;
+                if (solid < 2) continue;
+
                 float m = sqrtf(p.x * p.x + p.y * p.y + p.z * p.z);
                 if (m < 1.f || m > 1.0e6f) continue;
 
                 g_camCands.push_back(CamCand{ obj, o, stride, posOffs[k], m });
                 break;
             }
-            if (g_camCands.size() > 96) return;
+            if (g_camCands.size() > 512) return;
         }
     }
 }
@@ -587,13 +594,15 @@ static void FixCamera() {
     g_camRight = 0;
 
     uintptr_t roots[6] = { g_pc, g_delta, g_weak, g_lpc, g_world, g_game };
-    for (int i = 0; i < 6 && g_camCands.size() <= 96; ++i) {
+    for (int i = 0; i < 6; ++i) {
         if (!roots[i]) continue;
         ScanBasis(roots[i]);
-        for (uintptr_t o = 0; o < 0x800 && g_camCands.size() <= 96; o += 8) {
+        int kids = 0;
+        for (uintptr_t o = 0; o < 0x800 && kids < 128; o += 8) {
             uintptr_t sub = Read<uintptr_t>(roots[i] + o);
             if (!sub || sub < 0x10000) continue;
             if (!Readable(sub, 0x100)) continue;
+            kids++;
             ScanBasis(sub);
         }
     }
